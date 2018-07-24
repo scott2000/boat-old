@@ -19,6 +19,11 @@ data OpKind
   | Compact
   deriving (Show, Eq)
 
+isInfix :: OpKind -> Bool
+isInfix Wide = True
+isInfix Compact = True
+isInfix _ = False
+
 data Assoc
   = ALeft
   | ANon
@@ -43,43 +48,40 @@ instance Show Expr where
   show (Id name) = name
   show (Let name val expr) = "(let " ++ name ++ " = " ++ show val ++ " in " ++ show expr ++ ")"
 
-eval :: Expr -> Expr
-eval = f []
-  where
-    runOp :: String -> Expr -> Expr -> Expr
-    runOp op (Nat a) (Nat b) =
-      case op of
-        "+" -> Nat $ a+b
-        "-" -> Nat $ a-b
-        "*" -> Nat $ a*b
-        "/" -> Nat $ quot a b
-        "%" -> Nat $ rem a b
-        "^" -> Nat $ a^b
-        ">" -> Bool $ a>b
-        "<" -> Bool $ a<b
-        ">=" -> Bool $ a>=b
-        "<=" -> Bool $ a<=b
-        "==" -> Bool $ a==b
-        "!=" -> Bool $ a/=b
-        _   -> Op op (Nat a) (Nat b)
-    runOp op (Bool a) (Bool b) =
-      case op of
-        "||" -> Bool $ a||b
-        "&&" -> Bool $ a&&b
-        "==" -> Bool $ a==b
-        "!=" -> Bool $ a/=b
-        _   -> Op op (Bool a) (Bool b)
-    runOp op a b = Op op a b
+eval :: [[(String, Expr)]] -> Expr -> Expr
+eval l (Op op a b) = runOp op (eval l a) (eval l b)
+eval l (Id name) =
+  case name !? l of
+    Just x -> x
+    Nothing -> Id name
+eval l (Let name val expr) =
+  eval ([(name, eval l val)]:l) expr
+eval _ x = x
 
-    f :: [[(String, Expr)]] -> Expr -> Expr
-    f l (Op op a b) = runOp op (f l a) (f l b)
-    f l (Id name) =
-      case name !? l of
-        Just x -> x
-        Nothing -> Id name
-    f l (Let name val expr) =
-      f ([(name, f l val)]:l) expr
-    f _ x = x
+runOp :: String -> Expr -> Expr -> Expr
+runOp op (Nat a) (Nat b) =
+  case op of
+    "+" -> Nat $ a+b
+    "-" -> Nat $ a-b
+    "*" -> Nat $ a*b
+    "/" -> Nat $ quot a b
+    "%" -> Nat $ rem a b
+    "^" -> Nat $ a^b
+    ">" -> Bool $ a>b
+    "<" -> Bool $ a<b
+    ">=" -> Bool $ a>=b
+    "<=" -> Bool $ a<=b
+    "==" -> Bool $ a==b
+    "!=" -> Bool $ a/=b
+    _   -> Op op (Nat a) (Nat b)
+runOp op (Bool a) (Bool b) =
+  case op of
+    "||" -> Bool $ a||b
+    "&&" -> Bool $ a&&b
+    "==" -> Bool $ a==b
+    "!=" -> Bool $ a/=b
+    _   -> Op op (Bool a) (Bool b)
+runOp op a b = Op op a b
 
 (!?) :: Eq k => k -> [[(k, v)]] -> Maybe v
 (!?) _ [] = Nothing
@@ -94,24 +96,30 @@ eval = f []
       | otherwise = find key rest
 
 main :: IO ()
-main = forever $ do
-  putStr "\n> "
+main = putStrLn "\nType an expression to parse and evaluate it, leave blank to exit.\n" >> repl []
+
+repl :: [[(String, Expr)]] -> IO ()
+repl list = do
+  putStr "> "
   hFlush stdout
   testCode <- getLine
-  case parse (wholeFile exprParserDefault) "test" testCode of
-    Left err -> putStr ("ERROR: "++ parseErrorPretty err)
-    Right expr -> displayResults expr
+  if null testCode then
+    return ()
+  else
+    case parse (wholeFile exprParserDefault) "test" testCode of
+      Left err -> do
+        putStr ("ERROR: "++ parseErrorPretty err)
+        repl list
+      Right expr -> do
+        let res = eval list expr
+        putStrLn (show res)
+        repl [[("repr", expr), ("res", res)]]
 
 wholeFile :: Parser a -> Parser a
 wholeFile p = do
   res <- p
-  eof
+  sc' >> eof
   return res
-
-displayResults :: Expr -> IO ()
-displayResults expr = do
-  putStrLn (show expr)
-  putStrLn (" => " ++ show (eval expr))
 
 type Parser = Parsec Void String
 
@@ -119,13 +127,13 @@ word :: Parser String
 word = do
   first <- satisfy isIdentFirst
   rest <- takeWhileP Nothing isIdentRest
-  symbol (return (first:rest)) <?> "identifier"
+  return (first:rest) <?> "identifier"
   where
     isIdentFirst x = (isAlpha x || x == '_') && isAscii x
     isIdentRest x = (isAlpha x || isDigit x || x == '_') && isAscii x
 
 identifier :: Parser String
-identifier = try $ symbol $ do
+identifier = symbol $ do
   ident <- word
   if ident `elem` keywords then
     fail ("expected an identifier, found keyword `" ++ ident ++ "`")
@@ -133,7 +141,7 @@ identifier = try $ symbol $ do
     return ident
 
 key :: String -> Parser ()
-key w = try $ symbol $ do
+key w = do
   ident <- word
   if ident /= w then
     fail ("expected keyword `" ++ w ++ "`, found `" ++ ident ++ "`")
@@ -177,32 +185,30 @@ symbol p = sc' >> p
 
 letbinding :: Parser Expr
 letbinding = do
-  key "let"
+  symbol $ key "let"
   name <- identifier
-  sc' >> string "=" >> sc'
+  symbol $ char '='
   val <- exprParserDefault
-  key "in"
+  symbol $ key "in"
   expr <- exprParserDefault
   return (Let name val expr)
 
 number :: Parser Word64
-number = try (symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal)) <?> "number"
-
-bool :: Parser Bool
-bool = try (symbol (try (key "true" >> return True) <|> (key "false" >> return False))) <?> "boolean"
+number = symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal) <?> "number"
 
 paren :: Parser Expr
 paren = do
-  try $ symbol $ char '('
+  symbol $ char '('
   expr <- exprParserDefault
   symbol $ char ')'
   return expr
 
 exprParser1 :: Parser Expr
-exprParser1 = paren
-  <|> letbinding
-  <|> Id <$> identifier
-  <|> Bool <$> bool
+exprParser1 = try paren
+  <|> try letbinding
+  <|> Id <$> try identifier
+  <|> try (symbol $ key "true" >> return (Bool True))
+  <|> try (symbol $ key "false" >> return (Bool False))
   <|> Nat <$> number
   <?> "expression"
 
@@ -216,12 +222,15 @@ exprParserBase base prec =
     opExpr prec = do
       expr <- base
       (op, kind) <- operatorInContext
-      let newPrec = adjustPrec kind $ precedence op
-      case precError prec newPrec of
-        Just err -> fail err
-        Nothing -> do
-          other <- exprParser newPrec
-          exprParserBase (return (Op op expr other)) prec
+      if isInfix kind then
+        let newPrec = adjustPrec kind $ precedence op in
+        case precError prec newPrec of
+          Just err -> fail err
+          Nothing -> do
+            other <- exprParser newPrec
+            exprParserBase (return (Op op expr other)) prec
+      else
+        error ("cannot use operator of kind " ++ show kind ++ " here")
 
 exprParserDefault :: Parser Expr
 exprParserDefault = symbol $ exprParser minPrec
@@ -242,11 +251,11 @@ precError :: (Prec, Assoc) -> (Prec, Assoc) -> Maybe String
 precError (p0, a0) (p1, a1)
   | p0 == p1 =
     if a0 /= a1 then
-      Just ("cannot mix associativities of operators in same precedence level (" ++ show p0 ++ ")")
+      error ("cannot mix associativities of operators in same precedence level (" ++ show p0 ++ ")")
     else if a0 == ALeft then
       Just "left-assoc"
     else if a0 == ANon then
-      Just "non-associative operator chaining not allowed"
+      error "non-associative operator chaining not allowed"
     else
       Nothing
   | p0 > p1 = Just "high-prec"
@@ -263,6 +272,7 @@ precTable =
   [ (["||"], (2, ARight)),
     (["&&"], (3, ARight)),
     (["==", "!=", "<", "<=", ">", ">="], (4, ANon)),
+    (["::"], (5, ARight)),
     (["+", "-"], (6, ALeft)),
     (["*", "/", "%"], (7, ALeft)),
     (["^"], (8, ARight)) ]
