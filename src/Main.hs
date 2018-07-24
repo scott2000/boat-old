@@ -98,9 +98,15 @@ main = forever $ do
   putStr "\n> "
   hFlush stdout
   testCode <- getLine
-  case parse exprParserDefault "test" testCode of
+  case parse (wholeFile exprParserDefault) "test" testCode of
     Left err -> putStr ("ERROR: "++ parseErrorPretty err)
     Right expr -> displayResults expr
+
+wholeFile :: Parser a -> Parser a
+wholeFile p = do
+  res <- p
+  eof
+  return res
 
 displayResults :: Expr -> IO ()
 displayResults expr = do
@@ -126,8 +132,13 @@ identifier = try $ symbol $ do
   else
     return ident
 
-key :: String -> Parser String
-key w = try $ symbol $ string w
+key :: String -> Parser ()
+key w = try $ symbol $ do
+  ident <- word
+  if ident /= w then
+    fail ("expected keyword `" ++ w ++ "`, found `" ++ ident ++ "`")
+  else
+    return ()
 
 operator :: Parser String
 operator = (some $ oneOf "+-*/%^!=<>:?|&~$.") <?> "operator"
@@ -168,7 +179,7 @@ letbinding :: Parser Expr
 letbinding = do
   key "let"
   name <- identifier
-  key "="
+  sc' >> string "=" >> sc'
   val <- exprParserDefault
   key "in"
   expr <- exprParserDefault
