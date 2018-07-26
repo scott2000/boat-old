@@ -5,6 +5,7 @@ import Control.Monad (void, forever)
 import Data.Void
 import Data.Word
 import Data.Char
+import Data.Maybe
 import Text.Megaparsec
 import Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
@@ -36,6 +37,7 @@ data Expr
   = Nat Data.Word.Word64
   | Bool Bool
   | Op String Expr Expr
+  | App Expr Expr
   | Id String
   | Let String Expr Expr
   deriving Eq
@@ -45,8 +47,16 @@ instance Show Expr where
   show (Bool True) = "true"
   show (Bool False) = "false"
   show (Op op a b) = "(" ++ show a ++ " " ++ op ++ " " ++ show b ++ ")"
+  show (App a b) = "(" ++ show a ++ " " ++ show b ++ ")"
   show (Id name) = name
   show (Let name val expr) = "(let " ++ name ++ " = " ++ show val ++ " in " ++ show expr ++ ")"
+
+data Type
+  = TVar Word64
+  | TNat
+  | TBool
+  | TFunc Type Type
+  deriving Eq
 
 eval :: [[(String, Expr)]] -> Expr -> Expr
 eval l (Op op a b) = runOp op (eval l a) (eval l b)
@@ -58,29 +68,46 @@ eval l (Let name val expr) =
   eval ([(name, eval l val)]:l) expr
 eval _ x = x
 
+natOps :: [(String, Word64 -> Word64 -> Word64)]
+natOps =
+  [ ("+", (+)),
+    ("-", (-)),
+    ("*", (*)),
+    ("/", quot),
+    ("%", rem),
+    ("^", (^)) ]
+
+natCmpOps :: [(String, Word64 -> Word64 -> Bool)]
+natCmpOps =
+  [ ("<", (<)),
+    (">", (>)),
+    ("<=", (<=)),
+    (">=", (>=)),
+    ("==", (==)),
+    ("!=", (/=)) ]
+
+boolOps :: [(String, Bool -> Bool -> Bool)]
+boolOps =
+  [ ("||", (||)),
+    ("&&", (&&)),
+    ("==", (==)),
+    ("!=", (/=)) ]
+
+tryOp :: String -> a -> a -> (b -> Expr) -> [(String, a -> a -> b)] -> Maybe Expr
+tryOp _ _ _ _ [] = Nothing
+tryOp op a b c ((x, y):xs) =
+  if x == op then
+    Just $ c $ y a b
+  else
+    tryOp op a b c xs
+
 runOp :: String -> Expr -> Expr -> Expr
 runOp op (Nat a) (Nat b) =
-  case op of
-    "+" -> Nat $ a+b
-    "-" -> Nat $ a-b
-    "*" -> Nat $ a*b
-    "/" -> Nat $ quot a b
-    "%" -> Nat $ rem a b
-    "^" -> Nat $ a^b
-    ">" -> Bool $ a>b
-    "<" -> Bool $ a<b
-    ">=" -> Bool $ a>=b
-    "<=" -> Bool $ a<=b
-    "==" -> Bool $ a==b
-    "!=" -> Bool $ a/=b
-    _   -> Op op (Nat a) (Nat b)
+  fromMaybe (Op op (Nat a) (Nat b))
+    (tryOp op a b Nat natOps <|> tryOp op a b Bool natCmpOps)
 runOp op (Bool a) (Bool b) =
-  case op of
-    "||" -> Bool $ a||b
-    "&&" -> Bool $ a&&b
-    "==" -> Bool $ a==b
-    "!=" -> Bool $ a/=b
-    _   -> Op op (Bool a) (Bool b)
+  fromMaybe (Op op (Bool a) (Bool b))
+    (tryOp op a b Bool boolOps)
 runOp op a b = Op op a b
 
 (!?) :: Eq k => k -> [[(k, v)]] -> Maybe v
@@ -96,24 +123,63 @@ runOp op a b = Op op a b
       | otherwise = find key rest
 
 main :: IO ()
-main = putStrLn "\nType an expression to parse and evaluate it, leave blank to exit.\n" >> repl []
+main = putStrLn "\nType an expression to parse and evaluate it, type `:help` for options.\n" >> repl []
 
 repl :: [[(String, Expr)]] -> IO ()
 repl list = do
-  putStr "> "
+  putStr "birch> "
   hFlush stdout
   testCode <- getLine
-  if null testCode then
-    return ()
-  else
-    case parse (wholeFile exprParserDefault) "test" testCode of
-      Left err -> do
-        putStr ("ERROR: "++ parseErrorPretty err)
+  let parser = maybeCommand $ wholeFile exprParserDefault
+  case parse parser "repl" testCode of
+    Left err -> do
+      putStr ("ERROR: "++ parseErrorPretty err)
+      repl list
+    Right (Nothing, Nothing) -> repl list
+    Right (Just c, Nothing) -> do
+      quit <- interpretCommand c Nothing
+      if quit then
+        return ()
+      else
         repl list
-      Right expr -> do
-        let res = eval list expr
-        putStrLn (show res)
-        repl [[("repr", expr), ("res", res)]]
+    Right (command, Just expr) -> do
+      quit <- case command of
+        Just c -> interpretCommand c (Just expr)
+        Nothing -> return False
+      let res = eval list expr
+      putStrLn (show res)
+      repl [[("res", res)]]
+
+interpretCommand :: String -> Maybe Expr -> IO Bool
+interpretCommand "repr" (Just expr) = putStrLn (show expr) >> return False
+interpretCommand "quit" Nothing = return True
+interpretCommand "help" Nothing = do
+  putStrLn ""
+  putStrLn "valid commands:"
+  putStrLn "  :repr <expr>  display representation of <expr>"
+  putStrLn "  :help         display this help menu"
+  putStrLn "  :quit         exit the repl"
+  putStrLn ""
+  return False
+
+interpretCommand "repr" _ = putStrLn "expected expression for `repr`" >> return False
+interpretCommand "quit" _ = putStrLn "unexpected expression for `quit`" >> return False
+interpretCommand "help" _ = putStrLn "unexpected expression for `help`" >> return False
+interpretCommand c _ = putStrLn ("unknown command: `" ++ c ++ "`") >> return False
+
+maybeCommand :: Parser a -> Parser (Maybe String, Maybe a)
+maybeCommand target = do
+  c <- possible command
+  t <- possible target
+  return (c, t)
+  where
+    possible parser =
+      Just <$> parser
+      <|> return Nothing
+    command = do
+      sc' >> char ':'
+      c <- takeWhile1P Nothing isAlpha
+      sc' >> return c
 
 wholeFile :: Parser a -> Parser a
 wholeFile p = do
@@ -216,11 +282,11 @@ exprParser :: (Prec, Assoc) -> Parser Expr
 exprParser = exprParserBase exprParser1
 
 exprParserBase :: Parser Expr -> (Prec, Assoc) -> Parser Expr
-exprParserBase base prec =
-  try (opExpr prec) <|> base
+exprParserBase base prec = do
+  expr <- base
+  try (opExpr expr) <|> try (appExpr expr) <|> return expr
   where
-    opExpr prec = do
-      expr <- base
+    opExpr expr = do
       (op, kind) <- operatorInContext
       if isInfix kind then
         let newPrec = adjustPrec kind $ precedence op in
@@ -231,6 +297,12 @@ exprParserBase base prec =
             exprParserBase (return (Op op expr other)) prec
       else
         error ("cannot use operator of kind " ++ show kind ++ " here")
+    appExpr expr =
+      case precError prec appPrec of
+        Just err -> fail err
+        Nothing -> do
+          other <- exprParser appPrec
+          exprParserBase (return (App expr other)) prec
 
 exprParserDefault :: Parser Expr
 exprParserDefault = symbol $ exprParser minPrec
