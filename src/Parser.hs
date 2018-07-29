@@ -1,71 +1,17 @@
-module Parser ( Expr (..), Type (..), Parser, eval, (!?), exprParser, symbol, sc, sc' ) where
+module Parser ( Parser, exprParser, symbol, sc, sc' ) where
 
-import Data.Maybe
+import AST
+
 import Data.Void
 import Data.Word
 import Data.Char
-import Text.Megaparsec
+import Control.Monad.State
+import Text.Megaparsec hiding (State)
 import Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
 
-data Expr
-  = Nat Data.Word.Word64
-  | Bool Bool
-  | Op String Expr Expr
-  | App Expr Expr
-  | Id String
-  | Let String Expr Expr
-  | Func String [String] Expr
-  deriving Eq
-
-data Type
-  = TVar Word64
-  | TNat
-  | TBool
-  | TFunc Type Type
-  deriving Eq
-
-instance Show Expr where
-  show (Nat n) = show n
-  show (Bool True) = "true"
-  show (Bool False) = "false"
-  show (Op op a b) = "(" ++ show a ++ " " ++ op ++ " " ++ show b ++ ")"
-  show (App a b) = "(" ++ show a ++ " " ++ show b ++ ")"
-  show (Id name) = name
-  show (Let name val expr) = "(let " ++ name ++ " = " ++ show val ++ " in " ++ show expr ++ ")"
-  show (Func x xs expr) = "(\\" ++ x ++ " " ++ unwords xs ++ " -> " ++ show expr ++ ")"
-
-eval :: [[(String, Expr)]] -> Expr -> Expr
-eval l (Op op a b) = runOp op (eval l a) (eval l b)
-eval l (App a b) =
-  case (eval l a, eval l b) of
-    (Func x [] expr, param) ->
-      eval ([(x, eval l param)]:l) expr
-    (Func x (y:xs) expr, param) ->
-      Func y xs (eval ([(x, eval l param)]:l) expr)
-    (a, b) -> App a b
-eval l (Id name) =
-  case name !? l of
-    Just x -> x
-    Nothing -> Id name
-eval l (Let name val expr) =
-  eval ([(name, eval l val)]:l) expr
-eval l (Func x xs expr) = Func x xs (eval l expr)
-eval _ x = x
-
-(!?) :: Eq k => k -> [[(k, v)]] -> Maybe v
-(!?) _ [] = Nothing
-(!?) key (list:rest) =
-  case find key list of
-    Just v -> Just v
-    Nothing -> key !? rest
-  where
-    find _ [] = Nothing
-    find key ((k, v):rest)
-      | k == key = Just v
-      | otherwise = find key rest
-
-type Parser = Parsec Void String
+type MParser = Parsec Void String
+type Parser = StateT Word64 MParser
 
 exprParser :: Parser Expr
 exprParser = symbol $ exprParserPrec minPrec
@@ -74,7 +20,8 @@ exprParserPartial :: Parser Expr
 exprParserPartial = try paren
   <|> try function
   <|> try letbinding
-  <|> Id <$> try identifier
+  <|> try ifThenElse
+  <|> Id <$> try localVar
   <|> try (symbol $ key "true" >> return (Bool True))
   <|> try (symbol $ key "false" >> return (Bool False))
   <|> Nat <$> number
@@ -123,7 +70,7 @@ letbinding = do
   val <- exprParser
   symbol $ key "in"
   expr <- exprParser
-  return (Let name val expr)
+  return (Let name val expr) <?> "let binding"
 
 function :: Parser Expr
 function = do
@@ -133,13 +80,23 @@ function = do
   expr <- exprParser
   case vars of
     [] -> fail "functions must have at least one parameter (\\ -> ... is not allowed)"
-    (x:xs) -> return (Func x xs expr)
+    (x:xs) -> return (Func x xs expr) <?> "function literal"
   where
     someIdents = do
-      ident <- symbol identifier
+      ident <- symbol localVar
       others <- manyIdents
       return (ident : others)
     manyIdents = try someIdents <|> return []
+
+ifThenElse :: Parser Expr
+ifThenElse = do
+  symbol $ key "if"
+  i <- exprParser
+  symbol $ key "then"
+  t <- exprParser
+  symbol $ key "else"
+  e <- exprParser
+  return (If i t e) <?> "if-then-else"
 
 number :: Parser Word64
 number = symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal) <?> "number"
@@ -152,7 +109,7 @@ paren = do
   return expr
 
 keywords :: [String]
-keywords = ["let", "in", "true", "false"]
+keywords = ["let", "in", "true", "false", "if", "then", "else"]
 
 data OpKind
   = Wide
@@ -174,48 +131,6 @@ data Assoc
 
 type Prec = Int
 
-natOps :: [(String, Word64 -> Word64 -> Word64)]
-natOps =
-  [ ("+", (+)),
-    ("-", (-)),
-    ("*", (*)),
-    ("/", quot),
-    ("%", rem),
-    ("^", (^)) ]
-
-natCmpOps :: [(String, Word64 -> Word64 -> Bool)]
-natCmpOps =
-  [ ("<", (<)),
-    (">", (>)),
-    ("<=", (<=)),
-    (">=", (>=)),
-    ("==", (==)),
-    ("!=", (/=)) ]
-
-boolOps :: [(String, Bool -> Bool -> Bool)]
-boolOps =
-  [ ("||", (||)),
-    ("&&", (&&)),
-    ("==", (==)),
-    ("!=", (/=)) ]
-
-tryOp :: String -> a -> a -> (b -> Expr) -> [(String, a -> a -> b)] -> Maybe Expr
-tryOp _ _ _ _ [] = Nothing
-tryOp op a b c ((x, y):xs) =
-  if x == op then
-    Just $ c $ y a b
-  else
-    tryOp op a b c xs
-
-runOp :: String -> Expr -> Expr -> Expr
-runOp op (Nat a) (Nat b) =
-  fromMaybe (Op op (Nat a) (Nat b))
-    (tryOp op a b Nat natOps <|> tryOp op a b Bool natCmpOps)
-runOp op (Bool a) (Bool b) =
-  fromMaybe (Op op (Bool a) (Bool b))
-    (tryOp op a b Bool boolOps)
-runOp op a b = Op op a b
-
 word :: Parser String
 word = do
   first <- satisfy isIdentFirst
@@ -232,6 +147,18 @@ identifier = symbol $ do
     fail ("expected an identifier, found keyword `" ++ ident ++ "`")
   else
     return ident
+
+localVar :: Parser LocalVar
+localVar = do
+  ident <- identifier
+  ty <- newType
+  return (ident ::: ty)
+
+newType :: Monad m => StateT Word64 m Type
+newType = do
+  var <- get
+  put $ var+1
+  return (TVar var)
 
 key :: String -> Parser ()
 key w = do
