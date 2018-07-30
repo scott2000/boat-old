@@ -1,4 +1,4 @@
-module AST ( Expr (..), Type (..), LocalVar (..), OpEntry, eval, (!?), getOp, mkFuncTy ) where
+module AST ( Expr (..), Type (..), LocalVar (..), OpEntry, eval, (!?), getOp, mkFuncTy, tNat, tBool ) where
 
 import Data.Word
 
@@ -19,9 +19,9 @@ data LocalVar = (:::)
   deriving Eq
 
 data Type
-  = TVar Word64
-  | TNat
-  | TBool
+  = TAnon Word64
+  | TId String
+  | TVar String
   | TFunc Type Type
   deriving Eq
 
@@ -40,13 +40,13 @@ instance Show LocalVar where
   show (x ::: _) = x
 
   -- FOR DEBUGGING
-  -- show (x ::: (TVar _)) = x
+  -- show (x ::: (TAnon _)) = x
   -- show (x ::: t) = "(" ++ x ++ " : " ++ show t ++ ")"
 
 instance Show Type where
-  show (TVar n) = "<" ++ show n ++ ">"
-  show TNat = "Nat"
-  show TBool = "Bool"
+  show (TAnon n) = "{" ++ show n ++ "}"
+  show (TId s) = s
+  show (TVar s) = s
   show (TFunc a b) = "(" ++ show a ++ " -> " ++ show b ++ ")"
 
 eval :: [[(String, Expr)]] -> Expr -> Either String Expr
@@ -113,15 +113,15 @@ opList =
     b "||" (||),
     b "&&" (&&) ]
   where
-    n s op = (s, (TNat, TNat, f))
+    n s op = (s, (tNat, tNat, f))
       where
         f (Nat a) (Nat b) = Right (Nat (op a b))
         f _ _ = Left ("invalid inputs for numeric operator `" ++ s ++ "`, expected two `Nat` arguments")
-    c s op = (s, (TNat, TBool, f))
+    c s op = (s, (tNat, tBool, f))
       where
         f (Nat a) (Nat b) = Right (Bool (op a b))
         f _ _ = Left ("invalid inputs for comparison operator `" ++ s ++ "`, expected two `Nat` arguments")
-    b s op = (s, (TBool, TBool, f))
+    b s op = (s, (tBool, tBool, f))
       where
         f (Bool a) (Bool b) = Right (Bool (op a b))
         f _ _ = Left ("invalid inputs for boolean operator `" ++ s ++ "`, expected two `Bool` arguments")
@@ -135,3 +135,17 @@ getOp s =
 mkFuncTy :: [Type] -> Type -> Type
 mkFuncTy [] r = r
 mkFuncTy (x:xs) r = TFunc x (mkFuncTy xs r)
+
+tyString :: String -> Type
+tyString [] = error "type name cannot be empty"
+tyString s =
+  if head s `elem` ['A'..'Z'] then
+    TId s
+  else
+    TVar s
+
+tNat :: Type
+tNat = TId "Nat"
+
+tBool :: Type
+tBool = TId "Bool"

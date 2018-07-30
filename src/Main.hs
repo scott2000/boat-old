@@ -24,7 +24,7 @@ repl = do
     Eval expr ty ->
       case eval [] expr of
         Left err -> do
-          putStrLn ("EVAL ERROR: " ++ err)
+          putStrLn ("RUNTIME ERROR: " ++ err)
           repl
         Right res -> do
           putStrLn $ case ty of
@@ -50,11 +50,11 @@ iterRepl line = expect $ runParser (evalStateT parser 0) "repl" line
       sc' >> char ':'
       c <- takeWhile1P Nothing isAlpha
       sc' >> return c
-    expect (Left err) = putStr ("PARSE ERROR: " ++ parseErrorPretty err) >> return Ignore
+    expect (Left err) = putStr ("SYNTAX ERROR: " ++ parseErrorPretty err) >> return Ignore
     expect (Right (c, Nothing)) = run c Nothing
     expect (Right (c, Just e)) =
       case infer e of
-        Left err -> putStrLn ("INFER ERROR: " ++ err) >> return Ignore
+        Left err -> putStrLn ("ERROR: " ++ err) >> return Ignore
         Right expr -> run c $ Just expr
 
 run :: String -> Maybe (Expr, Type) -> IO ReplState

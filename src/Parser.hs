@@ -158,7 +158,7 @@ newType :: Monad m => StateT Word64 m Type
 newType = do
   var <- get
   put $ var+1
-  return (TVar var)
+  return (TAnon var)
 
 key :: String -> Parser ()
 key w = do

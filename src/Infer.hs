@@ -6,53 +6,87 @@ import Data.Word
 import Data.Maybe
 import Control.Monad.State
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 
-type InferState = StateT (Map.Map Word64 Type) (Either String)
+type InferMap = Map.Map Word64 Type
+type LocalSet = Set.Set String
+
+type InferState = StateT (InferMap, LocalSet) (Either String)
+type QuantifyState = State (InferMap, Int)
 
 infer :: Expr -> Either String (Expr, Type)
-infer expr = evalStateT i Map.empty
-  where
-    i = do
-      ty <- ty [] expr
-      expr <- doInfer expr
-      ty <- simplify ty
-      return (expr, ty)
+infer expr = do
+  (ty, (m, s)) <- runStateT (ty [] expr) (Map.empty, Set.empty)
+  let simple_expr = mapLocals (mapType $ simplify m) expr
+  let simple_ty = simplify m ty
+  let (final_ty, (q, _)) = runState (quantify simple_ty) (Map.empty, 0)
+  let final_expr = mapLocals (mapType $ simplify q) simple_expr
+  verify final_expr
+  Right (final_expr, final_ty)
 
-doInfer :: Expr -> InferState Expr
-doInfer (Op op a b) = do
-  a <- doInfer a
-  b <- doInfer b
-  return (Op op a b)
-doInfer (App a b) = do
-  a <- doInfer a
-  b <- doInfer b
-  return (App a b)
-doInfer (Id (name ::: ty)) = do
-  ty <- simplify ty
-  return (Id (name ::: ty))
-doInfer (Let name val expr) = do
-  val <- doInfer val
-  expr <- doInfer expr
-  return (Let name val expr)
-doInfer (If i t e) = do
-  i <- doInfer i
-  t <- doInfer t
-  e <- doInfer e
-  return (If i t e)
-doInfer (Func x xs expr) = do
-  x <- idInfer x
-  xs <- sequence $ map idInfer xs
-  expr <- doInfer expr
-  return (Func x xs expr)
+letters :: String
+letters = "abcdefghijklmnopqrstuvwxyz"
+
+generic_name :: Int -> String
+generic_name = helper 26 1
   where
-    idInfer (name ::: ty) = do
-      ty <- simplify ty
-      return (name ::: ty)
-doInfer other = return other
+    helper m s c =
+      if c >= m then
+        helper (m*26) (s+1) (c-m)
+      else
+        builder [] s c
+    builder a 0 _ = a
+    builder a s c =
+      builder ((letters !! (rem c 26)) : a) (s-1) (div c 26)
+
+quantify :: Type -> QuantifyState Type
+quantify (TAnon a) = do
+  (m, n) <- get
+  case Map.lookup a m of
+    Just x -> return x
+    Nothing -> do
+      let name = generic_name n
+      let var = TVar name
+      put (Map.insert a var m, n+1)
+      return var
+quantify (TFunc a b) = do
+  a <- quantify a
+  b <- quantify b
+  return (TFunc a b)
+quantify other = return other
+
+verify :: Expr -> Either String ()
+verify (Op _ a b) = verify a >> verify b
+verify (App a b) = verify a >> verify b
+verify (Id a) = verifyLocal a
+verify (Let _ a b) = verify a >> verify b
+verify (If a b c) = verify a >> verify b >> verify c
+verify (Func x xs expr) = do
+  verifyLocal x
+  sequence $ map verifyLocal xs
+  verify expr
+verify _ = return ()
+
+verifyLocal :: LocalVar -> Either String ()
+verifyLocal (n ::: (TAnon a)) =
+  Left ("cannot infer a concrete type for `" ++ n ++ "`")
+verifyLocal _ = Right ()
+
+mapLocals :: (LocalVar -> LocalVar) -> Expr -> Expr
+mapLocals f (Op op a b) = Op op (mapLocals f a) (mapLocals f b)
+mapLocals f (App a b) = App (mapLocals f a) (mapLocals f b)
+mapLocals f (Id a) = Id (f a)
+mapLocals f (Let name val expr) = Let name (mapLocals f val) (mapLocals f expr)
+mapLocals f (If i t e) = If (mapLocals f i) (mapLocals f t) (mapLocals f e)
+mapLocals f (Func x xs expr) = Func (f x) (map f xs) (mapLocals f expr)
+mapLocals _ other = other
+
+mapType :: (Type -> Type) -> LocalVar -> LocalVar
+mapType f (n ::: t) = (n ::: f t)
 
 ty :: [[(String, Type)]] -> Expr -> InferState Type
-ty _ (Nat _) = return TNat
-ty _ (Bool _) = return TBool
+ty _ (Nat _) = return tNat
+ty _ (Bool _) = return tBool
 ty l (Op op a b) = do
   a <- ty l a
   (t, r, _) <- lift $ getOp op
@@ -63,12 +97,12 @@ ty l (Op op a b) = do
 ty l (App a b) = do
   a <- ty l a
   b <- ty l b
-  s <- simplify a
-  case s of
+  (m, _) <- get
+  case simplify m a of
     TFunc t r -> do
       unify b t
       return r
-    other -> lift $ Left ("cannot apply to non-function type `" ++ show s ++ "`")
+    other -> lift $ Left ("cannot apply to non-function type `" ++ show other ++ "`")
 ty l (Id (name ::: t)) =
   case l !? name of
     Just x -> do
@@ -80,7 +114,7 @@ ty l (Let name val expr) = do
   ty ([(name, v)]:l) expr
 ty l (If i t e) = do
   i <- ty l i
-  unify i TBool
+  unify i tBool
   t <- ty l t
   e <- ty l e
   unify t e
@@ -90,39 +124,43 @@ ty l (Func x xs expr) = do
   res <- ty (types:l) expr
   return $ mkFuncTy (map typeof (x:xs)) res
 
-simplify :: Type -> InferState Type
-simplify (TVar a) = do
-  m <- get
+simplify :: InferMap -> Type -> Type
+simplify m (TAnon a) =
   case Map.lookup a m of
-    Just n -> simplify n
-    Nothing -> return (TVar a)
-simplify (TFunc a b) = do
-  a <- simplify a
-  b <- simplify b
-  return (TFunc a b)
-simplify other = return other
+    Just n -> simplify m n
+    Nothing -> TAnon a
+simplify m (TFunc a b) = TFunc (simplify m a) (simplify m b)
+simplify _ other = other
 
 unify :: Type -> Type -> InferState ()
 unify a b = do
-  a <- simplify a
-  b <- simplify b
-  u a b
+  (m, _) <- get
+  u (simplify m a) (simplify m b)
   where
-    u (TVar a) (TVar b) =
+    u (TAnon a) (TAnon b) =
       if a == b then
         return ()
       else
-        insertVar a (TVar b)
-    u (TVar a) other = insertVar a other
-    u other (TVar a) = insertVar a other
-    u TNat TNat = return ()
-    u TBool TBool = return ()
+        inserTAnon a (TAnon b)
+    u (TAnon a) other = inserTAnon a other
+    u other (TAnon a) = inserTAnon a other
+    u (TId a) (TId b) =
+      if a == b then
+        return ()
+      else
+        lift $ Left ("cannot unify named types `" ++ show a ++ "` and `" ++ show b ++ "`")
+    u (TVar a) (TVar b) =
+      if a == b then do
+        (m, s) <- get
+        put (m, Set.insert a s)
+      else
+        lift $ Left ("cannot unify type variables `" ++ show a ++ "` and `" ++ show b ++ "`")
     u (TFunc a0 b0) (TFunc a1 b1) = do
       unify a0 a1
       unify b0 b1
     u a b = lift $ Left ("cannot unify types `" ++ show a ++ "` and `" ++ show b ++ "`")
 
-insertVar :: Word64 -> Type -> InferState ()
-insertVar k v = do
-  m <- get
-  put $ Map.insert k v m
+inserTAnon :: Word64 -> Type -> InferState ()
+inserTAnon k v = do
+  (m, s) <- get
+  put (Map.insert k v m, s)
