@@ -1,4 +1,4 @@
-module Parser ( Parser, exprParser, symbol, sc, sc' ) where
+module Parser ( Parser, valParser, exprParser, symbol, sc, sc' ) where
 
 import AST
 
@@ -13,24 +13,31 @@ import qualified Text.Megaparsec.Char.Lexer as L
 type MParser = Parsec Void String
 type Parser = StateT Word64 MParser
 
-exprParser :: Parser Expr
+valParser :: Parser Decl
+valParser = do
+  key "val"
+  name <- name
+  symbol $ string "="
+  expr <- exprParser
+  return (Decl name expr)
+
+exprParser :: Parser (Typed Expr)
 exprParser = symbol $ exprParserPrec minPrec
 
-exprParserPartial :: Parser Expr
+exprParserPartial :: Parser (Typed Expr)
 exprParserPartial = try paren
-  <|> try function
-  <|> try letbinding
-  <|> try ifThenElse
-  <|> Id <$> try localVar
-  <|> try (symbol $ key "true" >> return (Bool True))
-  <|> try (symbol $ key "false" >> return (Bool False))
-  <|> Nat <$> number
-  <?> "expression"
+  <|> try (typed function)
+  <|> try (typed letbinding)
+  <|> try (typed ifThenElse)
+  <|> try (typed (Id <$> name))
+  <|> try (symbol $ key "true" >> return (Lit (Bool True) ::: tBool))
+  <|> try (symbol $ key "false" >> return (Lit (Bool False) ::: tBool))
+  <|> (::: tNat) <$> Lit <$> Nat <$> number
 
-exprParserPrec :: (Prec, Assoc) -> Parser Expr
+exprParserPrec :: (Prec, Assoc) -> Parser (Typed Expr)
 exprParserPrec = exprParserBase exprParserPartial
 
-exprParserBase :: Parser Expr -> (Prec, Assoc) -> Parser Expr
+exprParserBase :: Parser (Typed Expr) -> (Prec, Assoc) -> Parser (Typed Expr)
 exprParserBase base prec = do
   expr <- base
   try (opExpr expr) <|> try (appExpr expr) <|> return expr
@@ -43,7 +50,7 @@ exprParserBase base prec = do
           Just err -> fail err
           Nothing -> do
             other <- exprParserPrec newPrec
-            exprParserBase (return (Op op expr other)) prec
+            exprParserBase (typed (return (Op op expr other))) prec
       else
         error ("cannot use operator of kind " ++ show kind ++ " here")
     appExpr expr =
@@ -51,7 +58,7 @@ exprParserBase base prec = do
         Just err -> fail err
         Nothing -> do
           other <- exprParserPrec appPrec
-          exprParserBase (return (App expr other)) prec
+          exprParserBase (typed (return (App expr other))) prec
 
 symbol :: Parser a -> Parser a
 symbol p = sc' >> p
@@ -65,7 +72,7 @@ sc' = hidden (skipMany $ choice [space1, lineCmnt, blockCmnt])
 letbinding :: Parser Expr
 letbinding = do
   symbol $ key "let"
-  name <- identifier
+  name <- typed name
   symbol $ char '='
   val <- exprParser
   symbol $ key "in"
@@ -80,10 +87,10 @@ function = do
   expr <- exprParser
   case vars of
     [] -> fail "functions must have at least one parameter (\\ -> ... is not allowed)"
-    (x:xs) -> return (Func x xs expr) <?> "function literal"
+    xs -> return (Func xs expr) <?> "function literal"
   where
     someIdents = do
-      ident <- symbol localVar
+      ident <- typed name
       others <- manyIdents
       return (ident : others)
     manyIdents = try someIdents <|> return []
@@ -101,7 +108,7 @@ ifThenElse = do
 number :: Parser Word64
 number = symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal) <?> "number"
 
-paren :: Parser Expr
+paren :: Parser (Typed Expr)
 paren = do
   symbol $ char '('
   expr <- exprParser
@@ -109,7 +116,7 @@ paren = do
   return expr
 
 keywords :: [String]
-keywords = ["let", "in", "true", "false", "if", "then", "else"]
+keywords = ["val", "let", "in", "true", "false", "if", "then", "else"]
 
 data OpKind
   = Wide
@@ -148,11 +155,14 @@ identifier = symbol $ do
   else
     return ident
 
-localVar :: Parser LocalVar
-localVar = do
-  ident <- identifier
+name :: Parser Name
+name = Name <$> identifier
+
+typed :: Parser a -> Parser (Typed a)
+typed x = do
+  new <- x
   ty <- newType
-  return (ident ::: ty)
+  return (new ::: ty)
 
 newType :: Monad m => StateT Word64 m Type
 newType = do

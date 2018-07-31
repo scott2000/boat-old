@@ -14,15 +14,14 @@ type LocalSet = Set.Set String
 type InferState = StateT (InferMap, LocalSet) (Either String)
 type QuantifyState = State (InferMap, Int)
 
-infer :: Expr -> Either String (Expr, Type)
+infer :: Typed Expr -> Either String (Typed Expr)
 infer expr = do
-  (ty, (m, s)) <- runStateT (ty [] expr) (Map.empty, Set.empty)
-  let simple_expr = mapLocals (mapType $ simplify m) expr
-  let simple_ty = simplify m ty
-  let (final_ty, (q, _)) = runState (quantify simple_ty) (Map.empty, 0)
-  let final_expr = mapLocals (mapType $ simplify q) simple_expr
-  verify final_expr
-  Right (final_expr, final_ty)
+  (m, s) <- execStateT (ty [] expr) (Map.empty, Set.empty)
+  let simple_expr = mapTypes (simplify m) expr
+  let (q, _) = execState (quantify (typeof simple_expr)) (Map.empty, 0)
+  let final_expr = mapTypes (simplify q) simple_expr
+  verifyTypes final_expr
+  Right final_expr
 
 letters :: String
 letters = "abcdefghijklmnopqrstuvwxyz"
@@ -39,90 +38,93 @@ generic_name = helper 26 1
     builder a s c =
       builder ((letters !! (rem c 26)) : a) (s-1) (div c 26)
 
-quantify :: Type -> QuantifyState Type
+quantify :: Type -> QuantifyState ()
 quantify (TAnon a) = do
   (m, n) <- get
   case Map.lookup a m of
-    Just x -> return x
+    Just x -> return ()
     Nothing -> do
       let name = generic_name n
       let var = TVar name
       put (Map.insert a var m, n+1)
-      return var
-quantify (TFunc a b) = do
-  a <- quantify a
-  b <- quantify b
-  return (TFunc a b)
-quantify other = return other
+quantify (TFunc a b) = quantify a >> quantify b
+quantify _ = return ()
 
-verify :: Expr -> Either String ()
-verify (Op _ a b) = verify a >> verify b
-verify (App a b) = verify a >> verify b
-verify (Id a) = verifyLocal a
-verify (Let _ a b) = verify a >> verify b
-verify (If a b c) = verify a >> verify b >> verify c
-verify (Func x xs expr) = do
-  verifyLocal x
-  sequence $ map verifyLocal xs
-  verify expr
-verify _ = return ()
+class TypeMap a where
+  mapTypes :: (Type -> Type) -> a -> a
+  verifyTypes :: a -> Either String ()
 
-verifyLocal :: LocalVar -> Either String ()
-verifyLocal (n ::: (TAnon a)) =
-  Left ("cannot infer a concrete type for `" ++ n ++ "`")
-verifyLocal _ = Right ()
+instance (Show a, TypeMap a) => TypeMap (Typed a) where
+  mapTypes f (x ::: t) = (mapTypes f x ::: f t)
 
-mapLocals :: (LocalVar -> LocalVar) -> Expr -> Expr
-mapLocals f (Op op a b) = Op op (mapLocals f a) (mapLocals f b)
-mapLocals f (App a b) = App (mapLocals f a) (mapLocals f b)
-mapLocals f (Id a) = Id (f a)
-mapLocals f (Let name val expr) = Let name (mapLocals f val) (mapLocals f expr)
-mapLocals f (If i t e) = If (mapLocals f i) (mapLocals f t) (mapLocals f e)
-mapLocals f (Func x xs expr) = Func (f x) (map f xs) (mapLocals f expr)
-mapLocals _ other = other
+  verifyTypes (x ::: (TAnon _)) = do
+    verifyTypes x
+    Left ("cannot infer a concrete type for `" ++ show x ++ "`")
+  verifyTypes (x ::: _) = verifyTypes x
 
-mapType :: (Type -> Type) -> LocalVar -> LocalVar
-mapType f (n ::: t) = (n ::: f t)
+instance TypeMap Name where
+  mapTypes _ = id
+  verifyTypes _ = Right ()
 
-ty :: [[(String, Type)]] -> Expr -> InferState Type
-ty _ (Nat _) = return tNat
-ty _ (Bool _) = return tBool
-ty l (Op op a b) = do
-  a <- ty l a
-  (t, r, _) <- lift $ getOp op
-  b <- ty l b
-  unify a t
-  unify b t
-  return r
-ty l (App a b) = do
-  a <- ty l a
-  b <- ty l b
-  (m, _) <- get
-  case simplify m a of
-    TFunc t r -> do
+instance TypeMap Expr where
+  mapTypes f (Op op a b) = Op op (mapTypes f a) (mapTypes f b)
+  mapTypes f (App a b) = App (mapTypes f a) (mapTypes f b)
+  mapTypes f (If i t e) = If (mapTypes f i) (mapTypes f t) (mapTypes f e)
+  mapTypes f (Let name val expr) = Let (mapTypes f name) (mapTypes f val) (mapTypes f expr)
+  mapTypes f (Func xs expr) = Func (map (mapTypes f) xs) (mapTypes f expr)
+  mapTypes _ other = other
+
+  verifyTypes (Op _ a b) = verifyTypes a >> verifyTypes b
+  verifyTypes (App a b) = verifyTypes a >> verifyTypes b
+  verifyTypes (If i t e) = verifyTypes i >> verifyTypes t >> verifyTypes e
+  verifyTypes (Let name val expr) = verifyTypes name >> verifyTypes val >> verifyTypes expr
+  verifyTypes (Func xs expr) = do
+    sequence $ map verifyTypes xs
+    verifyTypes expr
+  verifyTypes _ = Right ()
+
+ty :: [(Name, Type)] -> Typed Expr -> InferState Type
+ty env (x ::: t) = do
+  x <- case x of
+    Lit (Nat _) -> return tNat
+    Lit (Bool _) -> return tBool
+    Id name ->
+      case lookup name env of
+        Just x -> return x
+        Nothing -> lift $ Left ("cannot find value: `" ++ show name ++ "`")
+    Op op a b -> do
+      a <- ty env a
+      (t, r, _) <- lift $ getOp op
+      b <- ty env b
+      unify a t
       unify b t
       return r
-    other -> lift $ Left ("cannot apply to non-function type `" ++ show other ++ "`")
-ty l (Id (name ::: t)) =
-  case l !? name of
-    Just x -> do
-      unify t x
-      return x
-    Nothing -> lift $ Left ("cannot find value: `" ++ name ++ "`")
-ty l (Let name val expr) = do
-  v <- ty l val
-  ty ([(name, v)]:l) expr
-ty l (If i t e) = do
-  i <- ty l i
-  unify i tBool
-  t <- ty l t
-  e <- ty l e
-  unify t e
+    App a b -> do
+      a <- ty env a
+      b <- ty env b
+      (m, _) <- get
+      case simplify m a of
+        TFunc t r -> do
+          unify b t
+          return r
+        other -> lift $ Left ("cannot apply to non-function type `" ++ show other ++ "`")
+    If i t e -> do
+      i <- ty env i
+      unify i tBool
+      t <- ty env t
+      e <- ty env e
+      unify t e
+      return t
+    Let (name ::: ex) val expr -> do
+      v <- ty env val
+      unify v ex
+      ty ((name, v):env) expr
+    Func xs expr -> do
+      let types = map (\(n ::: t) -> (n, t)) xs
+      res <- ty (reverse types ++ env) expr
+      return $ mkFuncTy (map typeof xs) res
+  unify x t
   return t
-ty l (Func x xs expr) = do
-  let types = map (\(n ::: t) -> (n, t)) (x:xs)
-  res <- ty (types:l) expr
-  return $ mkFuncTy (map typeof (x:xs)) res
 
 simplify :: InferMap -> Type -> Type
 simplify m (TAnon a) =
