@@ -84,13 +84,13 @@ instance TypeMap Expr where
   verifyTypes _ = Right ()
 
 ty :: [(Name, Type)] -> Typed Expr -> InferState Type
-ty env (x ::: t) = do
-  x <- case x of
-    Lit (Nat _) -> return tNat
-    Lit (Bool _) -> return tBool
+ty env (x ::: fin) = do
+  case x of
+    Lit (Nat _) -> unify fin tNat
+    Lit (Bool _) -> unify fin tBool
     Id name ->
       case lookup name env of
-        Just x -> return x
+        Just x -> unify fin x
         Nothing -> lift $ Left ("cannot find value: `" ++ show name ++ "`")
     Op op a b -> do
       a <- ty env a
@@ -98,33 +98,28 @@ ty env (x ::: t) = do
       b <- ty env b
       unify a t
       unify b t
-      return r
+      unify fin r
     App a b -> do
       a <- ty env a
       b <- ty env b
-      (m, _) <- get
-      case simplify m a of
-        TFunc t r -> do
-          unify b t
-          return r
-        other -> lift $ Left ("cannot apply to non-function type `" ++ show other ++ "`")
+      unify a $ TFunc b fin
     If i t e -> do
       i <- ty env i
       unify i tBool
       t <- ty env t
       e <- ty env e
       unify t e
-      return t
+      unify fin t
     Let (name ::: ex) val expr -> do
       v <- ty env val
       unify v ex
-      ty ((name, v):env) expr
+      e <- ty ((name, v):env) expr
+      unify fin e
     Func xs expr -> do
       let types = map (\(n ::: t) -> (n, t)) xs
       res <- ty (reverse types ++ env) expr
-      return $ mkFuncTy (map typeof xs) res
-  unify x t
-  return t
+      unify fin $ mkFuncTy (map typeof xs) res
+  return fin
 
 simplify :: InferMap -> Type -> Type
 simplify m (TAnon a) =
@@ -163,6 +158,14 @@ unify a b = do
     u a b = lift $ Left ("cannot unify types `" ++ show a ++ "` and `" ++ show b ++ "`")
 
 inserTAnon :: Word64 -> Type -> InferState ()
-inserTAnon k v = do
-  (m, s) <- get
-  put (Map.insert k v m, s)
+inserTAnon k v =
+  if typeContains k v then
+    lift $ Left ("infinitely recursive type constraint: " ++ show (TAnon k) ++ " = " ++ show v)
+  else do
+    (m, s) <- get
+    put (Map.insert k v m, s)
+
+typeContains :: Word64 -> Type -> Bool
+typeContains v (TAnon a) = a == v
+typeContains v (TFunc a b) = typeContains v a || typeContains v b
+typeContains _ _ = False
