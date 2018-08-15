@@ -1,27 +1,205 @@
-module Infer (infer) where
+module Infer (inferAll) where
 
 import AST
 
 import Data.Word
 import Data.Maybe
+import Data.List
+import Data.Graph
+import Control.Applicative
 import Control.Monad.State
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
-type InferMap = Map.Map Word64 Type
-type LocalSet = Set.Set String
+-- import Debug.Trace
 
-type InferState = StateT (InferMap, LocalSet) (Either String)
+type InferMap = Map.Map Word64 Type
+
+data InferData = Inf
+  { getAnonMap :: InferMap,
+    getLocalSet :: Set.Set String,
+    getVarCount :: Word64 }
+  deriving Show
+
+newInferData :: Word64 -> InferData
+newInferData c = Inf Map.empty Set.empty c
+
+insertAnon :: Word64 -> Type -> InferData -> InferData
+insertAnon n t (Inf m s c) = Inf (Map.insert n t m) s c
+
+insertLocal :: String -> InferData -> InferData
+insertLocal l (Inf m s c) = Inf m (Set.insert l s) c
+
+getNewVar :: InferState Word64
+getNewVar = do
+  Inf m s c <- get
+  put $ Inf m s (c+1)
+  return c
+
+data Globals = Globals
+  { globalVariables :: Map.Map Name Type,
+    inferenceVariables :: Map.Map Name Type }
+  deriving Show
+
+type InferState = StateT InferData (Either String)
 type QuantifyState = State (InferMap, Int)
 
-infer :: Typed Expr -> Either String (Typed Expr)
-infer expr = do
-  (m, s) <- execStateT (ty [] expr) (Map.empty, Set.empty)
-  let simple_expr = mapTypes (simplify m) expr
-  let (q, _) = execState (quantify (typeof simple_expr)) (Map.empty, 0)
-  let final_expr = mapTypes (simplify q) simple_expr
-  verifyTypes final_expr
-  Right final_expr
+type DepEntry = (Name, Set.Set Name)
+type MultiDepEntry = (Set.Set Name, Set.Set Name)
+
+type AliasMap = Map.Map String Word64
+type AnonMap = Map.Map Word64 Word64
+type AliasState = State (AnonMap, AliasMap, Word64)
+
+inferAll :: Word64 -> Env (Typed Expr) -> Either String (Env (Typed Expr))
+inferAll _ [] = Right []
+inferAll count globals = do
+  let allDeps = depList globals
+  let grouped = groupCycles allDeps
+  let red = removeRedundancies grouped
+  let sorted = tsort red
+  -- traceM $ unlines $ map (showDeps (:[])) allDeps
+  -- traceM $ unlines $ map (showDeps Set.toList) grouped
+  -- traceM $ unlines $ map (showDeps Set.toList) red
+  -- traceM $ show $ map Set.toList sorted
+  let values = map (flip getAllValues globals) sorted
+  inferEach count values Map.empty []
+  where
+    inferEach :: Word64
+              -> [Env (Typed Expr)]
+              -> Map.Map Name Type
+              -> Env (Typed Expr)
+              -> Either String (Env (Typed Expr))
+    inferEach count [] _ l = Right l
+    inferEach count (env:xs) m l = do
+      (count, env) <- infer m env count
+      inferEach count xs (Map.union m $ Map.fromList $ map typeNameList env) (env++l)
+
+-- TODO: quantify and verify all values after inference
+
+infer :: Map.Map Name Type -> Env (Typed Expr) -> Word64 -> Either String (Word64, Env (Typed Expr))
+infer m env count = do
+  (s, d) <- runStateT helper (newInferData count)
+  return (getVarCount d, s)
+  where
+    convertTypes :: (Name, Typed a) -> (Name, Type)
+    convertTypes (name, typed) = (name, typeof typed)
+    globals :: Globals
+    globals = Globals m (Map.fromList (map typeNameList env))
+    checkTypes :: (Name, Typed Expr) -> InferState Type
+    checkTypes (name, expr) = ty globals [] expr
+    simplifyTypes :: (Name, Typed Expr) -> InferState (Name, Typed Expr)
+    simplifyTypes (name, expr) = do
+      m <- gets getAnonMap
+      return (name, mapTypes (simplify m) expr)
+    helper :: InferState (Env (Typed Expr))
+    helper = do
+      sequence_ $ map checkTypes env
+      sequence $ map simplifyTypes env
+
+typeNameList :: (a, Typed b) -> (a, Type)
+typeNameList (a, b) = (a, typeof b)
+
+groupCycles :: [DepEntry] -> [MultiDepEntry]
+groupCycles = map from . stronglyConnCompR . into
+  where
+    into :: [DepEntry] -> [((), Name, [Name])]
+    into [] = []
+    into ((name, deps):xs) = ((), name, Set.toList deps) : into xs
+    from :: SCC ((), Name, [Name]) -> MultiDepEntry
+    from (AcyclicSCC ((), name, deps)) = (Set.singleton name, Set.fromList deps)
+    from (CyclicSCC list) = fromCyc (Set.empty, Set.empty) list
+    fromCyc :: MultiDepEntry -> [((), Name, [Name])] -> MultiDepEntry
+    fromCyc entry [] = entry
+    fromCyc entry (((), name, deps):xs) =
+      let (names, set) = fromCyc entry xs in
+      (Set.insert name names, Set.union set $ Set.fromList deps)
+
+removeRedundancies :: [MultiDepEntry] -> [MultiDepEntry]
+removeRedundancies = map helper
+  where
+    helper (names, deps) = (names, Set.difference deps names)
+
+tsort :: [MultiDepEntry] -> [Set.Set Name]
+tsort [] = []
+tsort deps = helper [] deps
+  where
+    helper acc deps
+      | null a = next
+      | otherwise = helper next newDeps
+      where
+        (a, b) = roots deps
+        next = acc ++ b
+        newDeps = foldr removeName a $ concat $ map Set.toList b
+    roots [] = ([], [])
+    roots ((e@(n, s)):xs)
+      | Set.null s = (a, n:b)
+      | otherwise = (e:a, b)
+      where
+        (a, b) = roots xs
+
+getAllValues :: Set.Set Name -> Env a -> Env a
+getAllValues _ [] = []
+getAllValues s ((e@(n, _)):xs)
+  | Set.member n s = e : rest
+  | otherwise = rest
+  where
+    rest = getAllValues s xs
+
+showDeps :: (a -> [Name]) -> (a, Set.Set Name) -> String
+showDeps f (name, set)
+  | Set.null set = show (f name) ++ "."
+  | otherwise = show (f name) ++ " -> " ++ (intercalate ", " $ map show $ Set.toList set)
+
+removeName :: Name -> [MultiDepEntry] -> [MultiDepEntry]
+removeName _ [] = []
+removeName n ((x, s):xs) = (x, Set.delete n s) : removeName n xs
+
+depList :: Env (Typed Expr) -> [DepEntry]
+depList = map helper
+  where
+    helper (name, expr) = (name, execState (deps [] expr) Set.empty)
+
+type AliasMode = Type -> State (Word64, Map.Map Word64 Type, Map.Map String Type) Type
+
+alias :: AliasMode -> Type -> InferState Type
+alias trans ty = do
+  m <- get
+  let (ty', (count', _, _)) = runState (trans ty) (getVarCount m, Map.empty, Map.empty)
+  put $ m { getVarCount = count' }
+  return ty'
+
+globalAlias :: AliasMode
+globalAlias (TAnon a) = do
+  (c, ma, mv) <- get
+  case Map.lookup a ma of
+    Just ty -> return ty
+    Nothing -> do
+      let ty = TAnon c
+      put (c+1, Map.insert a ty ma, mv)
+      return ty
+globalAlias (TVar v) = do
+  (c, ma, mv) <- get
+  case Map.lookup v mv of
+    Just ty -> return ty
+    Nothing -> do
+      let ty = TAnon c
+      put (c+1, ma, Map.insert v ty mv)
+      return ty
+globalAlias (TFunc a b) = TFunc <$> globalAlias a <*> globalAlias b
+globalAlias other = return other
+
+inferAlias :: AliasMode
+inferAlias (TVar v) = do
+  (c, ma, mv) <- get
+  case Map.lookup v mv of
+    Just ty -> return ty
+    Nothing -> do
+      let ty = TAnon c
+      put (c+1, ma, Map.insert v ty mv)
+      return ty
+inferAlias (TFunc a b) = TFunc <$> inferAlias a <*> inferAlias b
+inferAlias other = return other
 
 letters :: String
 letters = "abcdefghijklmnopqrstuvwxyz"
@@ -44,7 +222,7 @@ quantify (TAnon a) = do
   case Map.lookup a m of
     Just x -> return ()
     Nothing -> do
-      let name = generic_name n
+      let name = generic_name n                             -- TODO: ensure unique inferred type variable names
       let var = TVar name
       put (Map.insert a var m, n+1)
 quantify (TFunc a b) = quantify a >> quantify b
@@ -83,41 +261,49 @@ instance TypeMap Expr where
     verifyTypes expr
   verifyTypes _ = Right ()
 
-ty :: [(Name, Type)] -> Typed Expr -> InferState Type
-ty env (x ::: fin) = do
+ty :: Globals -> Env Type -> Typed Expr -> InferState Type
+ty glob env (x ::: fin) = do
   case x of
     Lit (Nat _) -> unify fin tNat
     Lit (Bool _) -> unify fin tBool
-    Id name ->
-      case lookup name env of
-        Just x -> unify fin x
-        Nothing -> lift $ Left ("cannot find value: `" ++ show name ++ "`")
+    Id name -> do
+      ty <-
+        case Map.lookup name (globalVariables glob) of
+          Just ty -> alias globalAlias ty
+          Nothing ->
+            case Map.lookup name (inferenceVariables glob) of
+              Just ty -> alias inferAlias ty
+              Nothing ->
+                case lookup name env of
+                  Just ty -> return ty
+                  Nothing -> lift $ Left ("cannot find value: `" ++ show name ++ "`")
+      unify fin ty
     Op op a b -> do
-      a <- ty env a
+      a <- ty glob env a
       (t, r, _) <- lift $ getOp op
-      b <- ty env b
+      b <- ty glob env b
       unify a t
       unify b t
       unify fin r
     App a b -> do
-      a <- ty env a
-      b <- ty env b
+      a <- ty glob env a
+      b <- ty glob env b
       unify a $ TFunc b fin
     If i t e -> do
-      i <- ty env i
+      i <- ty glob env i
       unify i tBool
-      t <- ty env t
-      e <- ty env e
+      t <- ty glob env t
+      e <- ty glob env e
       unify t e
       unify fin t
     Let (name ::: ex) val expr -> do
-      v <- ty env val
+      v <- ty glob env val
       unify v ex
-      e <- ty ((name, v):env) expr
+      e <- ty glob ((name, v):env) expr
       unify fin e
     Func xs expr -> do
       let types = map (\(n ::: t) -> (n, t)) xs
-      res <- ty (reverse types ++ env) expr
+      res <- ty glob (reverse types ++ env) expr
       unify fin $ mkFuncTy (map typeof xs) res
   return fin
 
@@ -129,27 +315,33 @@ simplify m (TAnon a) =
 simplify m (TFunc a b) = TFunc (simplify m a) (simplify m b)
 simplify _ other = other
 
+simplify1 :: InferMap -> Type -> Type
+simplify1 m (TAnon a) =
+  case Map.lookup a m of
+    Just n -> simplify m n
+    Nothing -> TAnon a
+simplify1 _ other = other
+
 unify :: Type -> Type -> InferState ()
 unify a b = do
-  (m, _) <- get
-  u (simplify m a) (simplify m b)
+  m <- gets getAnonMap
+  u (simplify1 m a) (simplify1 m b)
   where
     u (TAnon a) (TAnon b) =
       if a == b then
         return ()
       else
-        inserTAnon a (TAnon b)
-    u (TAnon a) other = inserTAnon a other
-    u other (TAnon a) = inserTAnon a other
+        insertTAnon a (TAnon b)
+    u (TAnon a) other = insertTAnon a other
+    u other (TAnon a) = insertTAnon a other
     u (TId a) (TId b) =
       if a == b then
         return ()
       else
         lift $ Left ("cannot unify named types `" ++ show a ++ "` and `" ++ show b ++ "`")
     u (TVar a) (TVar b) =
-      if a == b then do
-        (m, s) <- get
-        put (m, Set.insert a s)
+      if a == b then
+        modify (insertLocal a)
       else
         lift $ Left ("cannot unify type variables `" ++ show a ++ "` and `" ++ show b ++ "`")
     u (TFunc a0 b0) (TFunc a1 b1) = do
@@ -157,13 +349,12 @@ unify a b = do
       unify b0 b1
     u a b = lift $ Left ("cannot unify types `" ++ show a ++ "` and `" ++ show b ++ "`")
 
-inserTAnon :: Word64 -> Type -> InferState ()
-inserTAnon k v =
+insertTAnon :: Word64 -> Type -> InferState ()
+insertTAnon k v =
   if typeContains k v then
     lift $ Left ("infinitely recursive type constraint: " ++ show (TAnon k) ++ " = " ++ show v)
   else do
-    (m, s) <- get
-    put (Map.insert k v m, s)
+    modify (insertAnon k v)
 
 typeContains :: Word64 -> Type -> Bool
 typeContains v (TAnon a) = a == v

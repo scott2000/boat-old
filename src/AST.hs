@@ -8,6 +8,9 @@ module AST
     Name (..),
     Env,
     OpEntry,
+    declFromList,
+    declToList,
+    deps,
     eval,
     getOp,
     mkFuncTy,
@@ -17,15 +20,17 @@ module AST
 
 import Data.Word
 import Data.List
+import Control.Monad.State
+import qualified Data.Set as Set
 
 data Expr
-  = Lit Literal                                   -- literals
-  | Id Name                                       -- identifiers
-  | Op String (Typed Expr) (Typed Expr)           -- primitive operations
-  | App (Typed Expr) (Typed Expr)                 -- (a b)
-  | If (Typed Expr) (Typed Expr) (Typed Expr)     -- (if a then b else c)
-  | Let (Typed Name) (Typed Expr) (Typed Expr)    -- (let a = b in c)
-  | Func [Typed Name] (Typed Expr)                -- (\a -> b)
+  = Lit Literal                                 -- literals
+  | Id Name                                     -- identifiers
+  | Op String (Typed Expr) (Typed Expr)         -- primitive operations
+  | App (Typed Expr) (Typed Expr)               -- (a b)
+  | If (Typed Expr) (Typed Expr) (Typed Expr)   -- (if a then b else c)
+  | Let (Typed Name) (Typed Expr) (Typed Expr)  -- (let a = b in c)
+  | Func [Typed Name] (Typed Expr)              -- (\a -> b)
   deriving Eq
 
 data Type
@@ -47,7 +52,7 @@ data Literal
 
 data Value
   = VLit Literal
-  | Closure Env [Name] (Typed Expr)
+  | Closure (Env Value) [Name] (Typed Expr)
   deriving Eq
 
 data Decl
@@ -56,9 +61,9 @@ data Decl
 
 newtype Name
   = Name String
-  deriving Eq
+  deriving (Eq, Ord)
 
-type Env = [(Name, Value)]
+type Env a = [(Name, a)]
 
 instance Show Expr where
   show (Lit l) = show l
@@ -94,7 +99,28 @@ instance Show Decl where
 instance Show Name where
   show (Name s) = s
 
-eval :: Env -> Typed Expr -> Either String Value
+declFromList :: Env (Typed Expr) -> [Decl]
+declFromList = map (uncurry Decl)
+
+declToList :: [Decl] -> Env (Typed Expr)
+declToList = map (\(Decl n e) -> (n, e))
+
+deps :: [Name] -> Typed Expr -> State (Set.Set Name) ()
+deps env (expr ::: ty) =
+  case expr of
+    Id name ->
+      if name `elem` env then
+        return ()
+      else
+        modify (Set.insert name)
+    Op _ a b -> deps env a >> deps env b
+    App a b -> deps env a >> deps env b
+    If i t e -> deps env i >> deps env t >> deps env e
+    Let name val expr -> deps env val >> deps (valof name : env) expr
+    Func params expr -> deps (map valof params ++ env) expr
+    _ -> return ()
+
+eval :: Env Value -> Typed Expr -> Either String Value
 eval env (expr ::: ty) =
   case expr of
     Lit l -> Right (VLit l)

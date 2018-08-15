@@ -1,4 +1,4 @@
-module Parser ( Parser, valParser, exprParser, symbol, sc, sc' ) where
+module Parser ( MParser, Parser, declParser, exprParser, symbol, sc, sc' ) where
 
 import AST
 
@@ -13,16 +13,16 @@ import qualified Text.Megaparsec.Char.Lexer as L
 type MParser = Parsec Void String
 type Parser = StateT Word64 MParser
 
-valParser :: Parser Decl
-valParser = do
-  key "val"
+declParser :: Parser Decl
+declParser = do
+  symbol $ try $ key "val"
   name <- name
   symbol $ string "="
   expr <- exprParser
   return (Decl name expr)
 
 exprParser :: Parser (Typed Expr)
-exprParser = symbol $ exprParserPrec minPrec
+exprParser = symbol $ (exprParserPrec minPrec <?> "expression")
 
 exprParserPartial :: Parser (Typed Expr)
 exprParserPartial = try paren
