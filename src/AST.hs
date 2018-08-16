@@ -105,19 +105,23 @@ declFromList = map (uncurry Decl)
 declToList :: [Decl] -> Env (Typed Expr)
 declToList = map (\(Decl n e) -> (n, e))
 
-deps :: [Name] -> Typed Expr -> State (Set.Set Name) ()
-deps env (expr ::: ty) =
+deps :: Bool -> [Name] -> Typed Expr -> State (Set.Set Name) ()
+deps lam env (expr ::: ty) =
   case expr of
     Id name ->
       if name `elem` env then
         return ()
       else
         modify (Set.insert name)
-    Op _ a b -> deps env a >> deps env b
-    App a b -> deps env a >> deps env b
-    If i t e -> deps env i >> deps env t >> deps env e
-    Let name val expr -> deps env val >> deps (valof name : env) expr
-    Func params expr -> deps (map valof params ++ env) expr
+    Op _ a b -> deps lam env a >> deps lam env b
+    App a b -> deps lam env a >> deps lam env b
+    If i t e -> deps lam env i >> deps lam env t >> deps lam env e
+    Let name val expr -> deps lam env val >> deps lam (valof name : env) expr
+    Func params expr ->
+      if lam then
+        deps lam (map valof params ++ env) expr
+      else
+        return ()
     _ -> return ()
 
 eval :: Env Value -> Typed Expr -> Either String Value

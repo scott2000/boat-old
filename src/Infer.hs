@@ -11,7 +11,7 @@ import Control.Monad.State
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
--- import Debug.Trace
+import Debug.Trace
 
 type InferMap = Map.Map Word64 Type
 
@@ -50,17 +50,16 @@ type AliasState = State (AnonMap, AliasMap, Word64)
 inferAll :: Word64 -> Env (Typed Expr) -> Either String (Env (Typed Expr))
 inferAll _ [] = Right []
 inferAll count globals = do
-  let allDeps = depList globals
+  let allDeps = depList True globals
   let grouped = groupCycles allDeps
   let red = removeRedundancies grouped
   let sorted = tsort red
-  -- traceM $ unlines $ map (showDeps (:[])) allDeps
-  -- traceM $ unlines $ map (showDeps Set.toList) grouped
-  -- traceM $ unlines $ map (showDeps Set.toList) red
-  -- traceM $ show $ map Set.toList sorted
   let values = map (flip getAllValues globals) sorted
   (count, inferred) <- inferEach count values Map.empty []
-  sequence $ map (quantifyVerify 0) inferred
+  quantified <- sequence $ map (quantifyVerify 0) inferred
+  let funcDeps = depList False quantified
+  checkRecursiveDeps funcDeps
+  return quantified
   where
     inferEach :: Word64
               -> [Env (Typed Expr)]
@@ -150,19 +149,37 @@ getAllValues s ((e@(n, _)):xs)
   where
     rest = getAllValues s xs
 
-showDeps :: (a -> [Name]) -> (a, Set.Set Name) -> String
-showDeps f (name, set)
-  | Set.null set = show (f name) ++ "."
-  | otherwise = show (f name) ++ " -> " ++ (intercalate ", " $ map show $ Set.toList set)
-
 removeName :: Name -> [MultiDepEntry] -> [MultiDepEntry]
 removeName _ [] = []
 removeName n ((x, s):xs) = (x, Set.delete n s) : removeName n xs
 
-depList :: Env (Typed Expr) -> [DepEntry]
-depList = map helper
+depList :: Bool -> Env (Typed Expr) -> [DepEntry]
+depList lam = map helper
   where
-    helper (name, expr) = (name, execState (deps [] expr) Set.empty)
+    helper (name, expr) = (name, execState (deps lam [] expr) Set.empty)
+
+checkRecursiveDeps :: [DepEntry] -> Either String ()
+checkRecursiveDeps = helper []
+  where
+    showName name = "`" ++ show name ++ "`"
+    helper _ [] = Right ()
+    helper l ((name, deps):xs) =
+      let newL = name:l in
+      case deny [] newL deps of
+        [] -> helper newL xs
+        [x] -> Left (
+          "infinite loop in top level value: "
+          ++ showName x
+          ++ " directly uses itself")
+        err@(x:_) ->
+          Left (
+            "infinite loop in top level values: ("
+            ++ intercalate " => " (map show (err ++ [x]))
+            ++ " => ...)")
+    deny _ [] deps = []
+    deny list (x:xs) deps
+      | x `elem` deps = x:list
+      | otherwise = deny (x:list) xs deps
 
 type AliasMode = Type -> State (Word64, Map.Map Word64 Type, Map.Map String Type) Type
 
@@ -263,10 +280,16 @@ class TypeMap a where
 instance (Show a, TypeMap a) => TypeMap (Typed a) where
   mapTypes f (x ::: t) = (mapTypes f x ::: f t)
 
-  verifyTypes (x ::: (TAnon _)) = do
+  verifyTypes (x ::: t) = do
     verifyTypes x
-    Left ("cannot infer a concrete type for `" ++ show x ++ "`")
-  verifyTypes (x ::: _) = verifyTypes x
+    if deny t then
+      Left ("cannot infer a concrete type for `" ++ show x ++ "`")
+    else
+      Right ()
+    where
+      deny (TAnon _) = True
+      deny (TFunc a b) = deny a || deny b
+      deny _ = False
 
 instance TypeMap Name where
   mapTypes _ = id
@@ -353,7 +376,7 @@ simplify1 _ other = other
 unify :: Type -> Type -> InferState ()
 unify a b = do
   m <- gets getAnonMap
-  u (simplify1 m a) (simplify1 m b)
+  u (simplify m a) (simplify m b)
   where
     u (TAnon a) (TAnon b) =
       if a == b then
