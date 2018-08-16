@@ -81,9 +81,9 @@ letbinding = do
 
 function :: Parser Expr
 function = do
-  symbol $ char '\\'
+  symbol $ (char '\\' <|> char '\x3bb')
   vars <- manyIdents
-  symbol $ string "->"
+  symbol $ (string "->" <|> string "\x2192")
   expr <- exprParser
   case vars of
     [] -> fail "functions must have at least one parameter (\\ -> ... is not allowed)"
