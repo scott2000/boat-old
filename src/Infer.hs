@@ -17,23 +17,19 @@ type InferMap = Map.Map Word64 Type
 
 data InferData = Inf
   { getAnonMap :: InferMap,
-    getLocalSet :: Set.Set String,
     getVarCount :: Word64 }
   deriving Show
 
 newInferData :: Word64 -> InferData
-newInferData c = Inf Map.empty Set.empty c
+newInferData c = Inf Map.empty c
 
 insertAnon :: Word64 -> Type -> InferData -> InferData
-insertAnon n t (Inf m s c) = Inf (Map.insert n t m) s c
-
-insertLocal :: String -> InferData -> InferData
-insertLocal l (Inf m s c) = Inf m (Set.insert l s) c
+insertAnon n t (Inf m c) = Inf (Map.insert n t m) c
 
 getNewVar :: InferState Word64
 getNewVar = do
-  Inf m s c <- get
-  put $ Inf m s (c+1)
+  Inf m c <- get
+  put $ Inf m (c+1)
   return c
 
 data Globals = Globals
@@ -63,19 +59,27 @@ inferAll count globals = do
   -- traceM $ unlines $ map (showDeps Set.toList) red
   -- traceM $ show $ map Set.toList sorted
   let values = map (flip getAllValues globals) sorted
-  inferEach count values Map.empty []
+  (count, inferred) <- inferEach count values Map.empty []
+  sequence $ map (quantifyVerify 0) inferred
   where
     inferEach :: Word64
               -> [Env (Typed Expr)]
               -> Map.Map Name Type
               -> Env (Typed Expr)
-              -> Either String (Env (Typed Expr))
-    inferEach count [] _ l = Right l
+              -> Either String (Word64, Env (Typed Expr))
+    inferEach count [] _ l = Right (count, l)
     inferEach count (env:xs) m l = do
       (count, env) <- infer m env count
       inferEach count xs (Map.union m $ Map.fromList $ map typeNameList env) (env++l)
-
--- TODO: quantify and verify all values after inference
+    quantifyVerify :: Int -> (Name, Typed Expr) -> Either String (Name, Typed Expr)
+    quantifyVerify count (name, expr) =
+      let
+        locals = execState (getLocals expr) Set.empty
+        (m, count') = execState (quantify locals (typeof expr)) (Map.empty, count)
+        simplified = mapTypes (simplify m) expr
+      in do
+        verifyTypes simplified
+        return (name, simplified)
 
 infer :: Map.Map Name Type -> Env (Typed Expr) -> Word64 -> Either String (Word64, Env (Typed Expr))
 infer m env count = do
@@ -216,17 +220,41 @@ generic_name = helper 26 1
     builder a s c =
       builder ((letters !! (rem c 26)) : a) (s-1) (div c 26)
 
-quantify :: Type -> QuantifyState ()
-quantify (TAnon a) = do
+unique_name :: Set.Set String -> Int -> (Int, String)
+unique_name deny n
+  | Set.member name deny = unique_name deny (n+1)
+  | otherwise = (n+1, name)
+  where
+    name = generic_name n
+
+quantify :: Set.Set String -> Type -> QuantifyState ()
+quantify deny (TAnon a) = do
   (m, n) <- get
   case Map.lookup a m of
     Just x -> return ()
     Nothing -> do
-      let name = generic_name n                             -- TODO: ensure unique inferred type variable names
+      let (n', name) = unique_name deny n
       let var = TVar name
-      put (Map.insert a var m, n+1)
-quantify (TFunc a b) = quantify a >> quantify b
-quantify _ = return ()
+      put (Map.insert a var m, n')
+quantify deny (TFunc a b) = quantify deny a >> quantify deny b
+quantify deny _ = return ()
+
+getLocals :: Typed Expr -> State (Set.Set String) ()
+getLocals (x ::: t) = do
+  case t of
+    TVar name -> modify (Set.insert name)
+    _ -> return ()
+  case x of
+    Op _ a b -> getLocals a >> getLocals b
+    App a b -> getLocals a >> getLocals b
+    If i t e -> getLocals i >> getLocals t >> getLocals e
+    Let name val expr -> locName name >> getLocals val >> getLocals expr
+    Func xs expr -> sequence (map locName xs) >> getLocals expr
+    _ -> return ()
+  where
+    locName :: Typed Name -> State (Set.Set String) ()
+    locName (_ ::: (TVar name)) = modify (Set.insert name)
+    locName _ = return ()
 
 class TypeMap a where
   mapTypes :: (Type -> Type) -> a -> a
@@ -341,7 +369,7 @@ unify a b = do
         lift $ Left ("cannot unify named types `" ++ show a ++ "` and `" ++ show b ++ "`")
     u (TVar a) (TVar b) =
       if a == b then
-        modify (insertLocal a)
+        return ()
       else
         lift $ Left ("cannot unify type variables `" ++ show a ++ "` and `" ++ show b ++ "`")
     u (TFunc a0 b0) (TFunc a1 b1) = do
