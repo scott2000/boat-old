@@ -1,4 +1,4 @@
-module Infer (inferAll) where
+module Infer (inferAll, simplify, TypeMap(..)) where
 
 import AST
 
@@ -42,10 +42,6 @@ type QuantifyState = State (InferMap, Int)
 
 type DepEntry = (Name, Set.Set Name)
 type MultiDepEntry = (Set.Set Name, Set.Set Name)
-
-type AliasMap = Map.Map String Word64
-type AnonMap = Map.Map Word64 Word64
-type AliasState = State (AnonMap, AliasMap, Word64)
 
 inferAll :: Word64 -> Env (Typed Expr) -> Either String (Env (Typed Expr))
 inferAll _ [] = Right []

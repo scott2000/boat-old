@@ -3,6 +3,7 @@ module Main where
 import Infer
 import Parser
 import AST
+import Compile
 
 import System.IO (hFlush, stdout, readFile)
 import System.Environment (getArgs)
@@ -40,7 +41,7 @@ startCompile path = do
         Right inferred -> do
           putStr $ unlines $ map show $ declFromList inferred
           header "compiled"
-          putStrLn "ERROR: not yet implemented"
+          testCompile inferred
   where
     header x = putStrLn ("\n-- " ++ x ++ " --\n")
 

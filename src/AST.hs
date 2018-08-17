@@ -12,6 +12,8 @@ module AST
     declToList,
     deps,
     eval,
+    countLocals,
+    zipEnv,
     getOp,
     mkFuncTy,
     tNat,
@@ -152,6 +154,44 @@ eval env (expr ::: ty) =
     Func xs expr ->
       Right (Closure env (map valof xs) expr)
 
+countLocals :: [Name] -> Typed Expr -> Env Int -> Env Int
+countLocals globals (expr ::: _) env =
+  case expr of
+    Id name
+      | name `elem` globals -> env
+      | otherwise -> addName name env
+    Op _ a b ->
+      countLocals globals b (countLocals globals a env)
+    App a b ->
+      countLocals globals b (countLocals globals a env)
+    If i t e ->
+      let
+        env' = countLocals globals i env
+        te = countLocals globals t env'
+        ee = countLocals globals e env'
+      in
+        zipEnv max te ee
+    Let (name ::: _) val expr ->
+      tail $ countLocals globals expr ((name, 0) : countLocals globals val env)
+    Func xs expr ->
+      let
+        params = map (\(x ::: _) -> (x, 0)) xs
+        env' = params ++ env
+      in
+        drop (length xs) (countLocals globals expr env')
+    _ -> env
+  where
+    addName name ((e@(n, x)):xs) =
+      if n == name then
+        (n, x+1):xs
+      else
+        e : addName name xs
+
+zipEnv :: (a -> b -> c) -> Env a -> Env b -> Env c
+zipEnv _ [] [] = []
+zipEnv f ((n, a):as) ((m, b):bs)
+  | n == m = (n, f a b) : zipEnv f as bs
+
 applyValue :: Value -> Value -> Either String Value
 applyValue (Closure env (x:xs) expr) param =
   let new_env = (x, param):env in
@@ -169,7 +209,7 @@ opList =
     n "*" (*),
     n "/" quot,
     n "%" rem,
-    n "^" (^),
+    -- n "^" (^),
     c "<" (<),
     c ">" (>),
     c "<=" (<=),
