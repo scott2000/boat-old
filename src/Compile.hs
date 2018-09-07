@@ -6,6 +6,7 @@ module Compile (testCompile) where
 import AST
 
 import qualified LLVM.AST as LLVM
+import qualified LLVM.AST.Typed as LLVM
 import qualified LLVM.AST.Constant as C
 import qualified LLVM.AST.Linkage as L
 import qualified LLVM.AST.Visibility as V
@@ -28,6 +29,8 @@ import Data.Text.Lazy (unpack)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
+import Debug.Trace -- TODO remove
+
 data Codegen = Codegen
   { anonymousFunctions :: [ClosureData],
     values :: Env Value,
@@ -40,7 +43,8 @@ data ClosureData = ClosureData
     getParameters :: [Typed Name],
     getInnerExpr :: Typed Expr,
     getInfo :: Operand,
-    getFunc :: Operand }
+    getFunc :: Operand,
+    getFwd :: Operand }
   deriving Show
 
 type BuilderState = StateT Codegen ModuleBuilder
@@ -100,6 +104,10 @@ genExpr env (expr ::: ty) =
       a <- genExpr env a `named` "lhs"
       b <- genExpr env b `named` "rhs"
       genOp op a b
+    App a b -> do
+      a <- genExpr env a `named` "app.func"
+      b <- genExpr env b `named` "app.arg"
+      genCallClosure a b
     If i t e -> do
       i <- genExpr env i `named` "if.cond"
       genIf i (genExpr env t) (genExpr env e)
@@ -108,7 +116,6 @@ genExpr env (expr ::: ty) =
       genExpr ((name, val):env) expr
     Func xs expr ->
       lift (getStaticClosureData xs expr) >>= genClosureForData env
-    other -> error ("not yet implemented: code gen for " ++ show other)
 
 genTy :: Type -> LLVM.Type
 genTy (TId "Nat") = i64
@@ -200,7 +207,8 @@ buildStaticClosure free params expr = mdo
   let
     len = length anons
     infoName = fromString ("info." ++ show len)
-    defType = LLVM.FunctionType returnType (map (genTy . typeof) combinedArgs) False
+    fwdParamTypes = ptr i8 : map (genTy . typeof) params
+    fwdType = LLVM.FunctionType returnType fwdParamTypes False
     def = LLVM.GlobalVariable
       infoName
       L.External
@@ -212,17 +220,45 @@ buildStaticClosure free params expr = mdo
       infoTy
       (AddrSpace 0)
       (Just (C.Struct Nothing False
-        [ C.BitCast (C.GlobalReference (ptr defType) closureName) (ptr voidFuncTy),
+        [ C.BitCast (C.GlobalReference (ptr fwdType) fwdName) (ptr voidFuncTy),
           C.Null (ptr destructorTy) ]))
       Nothing
       Nothing
       0
       []
     paramType (Name name ::: ty) = (genTy ty, fromString name)
-    closureName = fromString ("func." ++ show len)
+    funcName = fromString ("func." ++ show len)
+    fwdName = fromString ("fwd." ++ show len)
     returnType = genTy $ typeof expr
   emitDefn (LLVM.GlobalDefinition def)
-  func <- function closureName (map paramType combinedArgs) returnType body
+  func <- function funcName (map paramType combinedArgs) returnType body
+  let
+    fwdBody [dataPtr, lastParam] = do
+      block `named` "entry"
+      (args, freePtr) <- iter dataPtr params
+      loadedFrees <- if null free then
+        return []
+      else do
+        let structTy = LLVM.StructureType False $ map (genTy . typeof) free
+        castPtr <- bitcast freePtr (ptr structTy) `named` "free.cast"
+        let
+          loadFree n = do
+            varPtr <- gep castPtr [lcint 32 0, lcint 32 n] `named` "free.ptr"
+            load varPtr 0 `named` "free"
+        sequence $ map loadFree [0 .. toInteger (length free - 1)]
+      res <- call func (map (\x -> (x, [])) (loadedFrees ++ args)) `named` "forward"
+      ret res
+      where
+        iter p (_:[]) = return ([lastParam], p)
+        iter p (x:xs) = do
+          cast <- bitcast p (ptr $ LLVM.StructureType False [genTy $ typeof x, ptr i8]) `named` "data.cast"
+          paramPtr <- gep cast [lcint 32 0, lcint 32 0] `named` "data.param.ptr"
+          param <- load paramPtr 0 `named` "data.param"
+          nextPtr <- gep cast [lcint 32 0, lcint 32 1] `named` "data.next.ptr"
+          next <- load nextPtr 0 `named` "data.next"
+          (r, p) <- iter next xs
+          return (param:r, p)
+  fwd <- function fwdName [(ptr i8, "data.ptr"), (paramType $ last params)] returnType fwdBody
   let
     result = ClosureData
       { getClosureIndex = len,
@@ -230,7 +266,8 @@ buildStaticClosure free params expr = mdo
         getParameters = params,
         getInnerExpr = expr,
         getInfo = LLVM.ConstantOperand (C.GlobalReference (ptr infoTy) infoName),
-        getFunc = func }
+        getFunc = func,
+        getFwd = fwd }
   return result
   where
     combinedArgs = free ++ params
@@ -250,19 +287,41 @@ genClosureForData env closureData = do
   dataPtr <- if null frees then
       return $ LLVM.ConstantOperand $ C.Null $ ptr i8
     else do
-      dataPtr <- malloc $ LLVM.StructureType False storedType
+      (dataPtr, dataPtrI8) <- malloc $ LLVM.StructureType False storedType
       let
         freeMap (name ::: _) n =
           case lookup name env of
             Nothing -> error ("missing capture for closure: `" ++ show name ++ "`")
             Just res -> do
-              addr <- gep dataPtr
-                [ LLVM.ConstantOperand $ C.Int 32 0,
-                  LLVM.ConstantOperand $ C.Int 32 n ] `named` "capture"
+              addr <- gep dataPtr [lcint 32 0, lcint 32 n] `named` "capture"
               store addr 0 res
       sequence $ zipWith freeMap frees [0..]
-      bitcast dataPtr (ptr i8) `named` "data.ptr"
-  genStruct [getInfo closureData, LLVM.ConstantOperand $ C.Int 32 $ toInteger $ length params - 1, dataPtr]
+      return dataPtrI8
+  genStruct [getInfo closureData, lcint 32 $ toInteger $ length params - 1, dataPtr]
+
+genCallClosure :: Operand -> Operand -> Builder Operand
+genCallClosure closure arg = mdo
+  arity <- extractValue closure [1] `named` "arity"
+  isSaturated <- icmp ICMP.EQ arity (lcint 32 0) `named` "saturated"
+  condBr isSaturated thenBlock elseBlock
+  thenBlock <- block `named` "call.saturated"
+  infoPtr <- extractValue closure [0] `named` "info.ptr"
+  funcPtr <- gep infoPtr [lcint 32 0, lcint 32 0] `named` "func.ptr"
+  -- TODO: Cast function pointer to correct type
+  func <- load funcPtr 0 `named` "func"
+  thenRes <- call func [(arg, [])] `named` "res.sat"
+  br endBlock
+  elseBlock <- block `named` "call.unsaturated"
+  dataPtr <- extractValue closure [2] `named` "data.ptr"
+  (newDataPtr, newDataPtrI8) <- malloc $ LLVM.StructureType False [LLVM.typeOf arg, ptr i8]
+  -- TODO: Unsaturated partial application
+  elseRes <- int64 0
+  br endBlock
+  endBlock <- block `named` "call.end"
+  phi [(thenRes, thenBlock), (elseRes, elseBlock)]
+
+lcint :: Word32 -> Integer -> Operand
+lcint n m = LLVM.ConstantOperand $ C.Int n m
 
 genStruct :: [Operand] -> Builder Operand
 genStruct operands = iter 0 operands $ LLVM.ConstantOperand $ C.Struct Nothing False $ map base operands
@@ -275,10 +334,11 @@ genStruct operands = iter 0 operands $ LLVM.ConstantOperand $ C.Struct Nothing F
     iter n (LLVM.ConstantOperand _ : xs) o = iter (n+1) xs o
     iter n (x:xs) o = insertValue o x [n] >>= iter (n+1) xs
 
-malloc :: LLVM.Type -> Builder Operand
+malloc :: LLVM.Type -> Builder (Operand, Operand)
 malloc ty = do
   Just malloc <- lift $ gets getMalloc
   wordSize <- gets getWordSize
   let gep = C.GetElementPtr False (C.Null $ ptr ty) [C.Int 32 1]
   res <- call malloc [(LLVM.ConstantOperand $ C.PtrToInt gep (LLVM.IntegerType wordSize), [])] `named` "malloc.call"
-  bitcast res (ptr ty) `named` "malloc.ptr"
+  cast <- bitcast res (ptr ty) `named` "malloc.ptr"
+  return (cast, res)
