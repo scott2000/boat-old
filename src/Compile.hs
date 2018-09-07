@@ -107,7 +107,9 @@ genExpr env (expr ::: ty) =
     App a b -> do
       a <- genExpr env a `named` "app.func"
       b <- genExpr env b `named` "app.arg"
-      genCallClosure a b
+      case ty of
+        TFunc _ _ -> genCallClosure a b
+        _ -> genCallClosureNF (genTy ty) a b
     If i t e -> do
       i <- genExpr env i `named` "if.cond"
       genIf i (genExpr env t) (genExpr env e)
@@ -207,8 +209,7 @@ buildStaticClosure free params expr = mdo
   let
     len = length anons
     infoName = fromString ("info." ++ show len)
-    fwdParamTypes = ptr i8 : map (genTy . typeof) params
-    fwdType = LLVM.FunctionType returnType fwdParamTypes False
+    fwdType = LLVM.FunctionType returnType [ptr i8, genTy $ typeof $ last params] False
     def = LLVM.GlobalVariable
       infoName
       L.External
@@ -299,23 +300,39 @@ genClosureForData env closureData = do
       return dataPtrI8
   genStruct [getInfo closureData, lcint 32 $ toInteger $ length params - 1, dataPtr]
 
+genCallClosureNF :: LLVM.Type -> Operand -> Operand -> Builder Operand
+genCallClosureNF retType closure arg = do
+  dataPtr <- extractValue closure [2] `named` "data.ptr"
+  infoPtr <- extractValue closure [0] `named` "info.ptr"
+  funcPtr <- gep infoPtr [lcint 32 0, lcint 32 0] `named` "func.ptr"
+  func <- load funcPtr 0 `named` "func"
+  let funcTy = LLVM.FunctionType retType [ptr i8, LLVM.typeOf arg] False
+  castFunc <- bitcast func (ptr funcTy) `named` "func.cast"
+  call castFunc [(dataPtr, []), (arg, [])]
+
 genCallClosure :: Operand -> Operand -> Builder Operand
 genCallClosure closure arg = mdo
   arity <- extractValue closure [1] `named` "arity"
+  dataPtr <- extractValue closure [2] `named` "data.ptr"
   isSaturated <- icmp ICMP.EQ arity (lcint 32 0) `named` "saturated"
   condBr isSaturated thenBlock elseBlock
   thenBlock <- block `named` "call.saturated"
   infoPtr <- extractValue closure [0] `named` "info.ptr"
   funcPtr <- gep infoPtr [lcint 32 0, lcint 32 0] `named` "func.ptr"
-  -- TODO: Cast function pointer to correct type
   func <- load funcPtr 0 `named` "func"
-  thenRes <- call func [(arg, [])] `named` "res.sat"
+  let castTy = LLVM.FunctionType funcTy [ptr i8, LLVM.typeOf arg] False
+  castFunc <- bitcast func (ptr castTy) `named` "func.cast"
+  thenRes <- call castFunc [(dataPtr, []), (arg, [])] `named` "res.sat"
   br endBlock
   elseBlock <- block `named` "call.unsaturated"
-  dataPtr <- extractValue closure [2] `named` "data.ptr"
   (newDataPtr, newDataPtrI8) <- malloc $ LLVM.StructureType False [LLVM.typeOf arg, ptr i8]
-  -- TODO: Unsaturated partial application
-  elseRes <- int64 0
+  argPtr <- gep newDataPtr [lcint 32 0, lcint 32 0] `named` "data.arg"
+  store argPtr 0 arg
+  nextPtr <- gep newDataPtr [lcint 32 0, lcint 32 1] `named` "data.next"
+  store nextPtr 0 dataPtr
+  newArity <- sub arity (lcint 32 1) `named` "arity.new"
+  closureUpdated <- insertValue closure newArity [1] `named` "insert"
+  elseRes <- insertValue closureUpdated newDataPtrI8 [2] `named` "res.unsat"
   br endBlock
   endBlock <- block `named` "call.end"
   phi [(thenRes, thenBlock), (elseRes, elseBlock)]
