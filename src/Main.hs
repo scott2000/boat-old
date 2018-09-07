@@ -41,7 +41,7 @@ startCompile path = do
         Right inferred -> do
           putStr $ unlines $ map show $ declFromList inferred
           header "compiled"
-          testCompile inferred
+          testCompile inferred 64
   where
     header x = putStrLn ("\n-- " ++ x ++ " --\n")
 
