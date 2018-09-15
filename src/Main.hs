@@ -1,8 +1,9 @@
 module Main where
 
-import Infer
-import Parser
 import AST
+import Parser
+import Infer
+import Run
 import Compile
 
 import System.IO (hFlush, stdout, readFile)
@@ -37,11 +38,16 @@ startCompile path = do
       putStr $ unlines $ map show vals
       header "inferred"
       case inferAll nextAnon $ declToList vals of
-        Left err -> putStrLn ("ERROR: " ++ err)
+        Left err -> putStrLn ("TYPE ERROR: " ++ err)
         Right inferred -> do
           putStr $ unlines $ map show $ declFromList inferred
-          header "compiled"
-          testCompile inferred 64
+          header "evaluate"
+          case evaluateAll inferred of
+            Left err -> putStrLn ("ERROR: " ++ err)
+            Right evaluated -> do
+              putStr $ unlines $ map (\(n,x) -> show n ++ " = " ++ show x) evaluated
+              header "compiled"
+              testCompile evaluated 64
   where
     header x = putStrLn ("\n-- " ++ x ++ " --\n")
 

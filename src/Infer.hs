@@ -11,8 +11,6 @@ import Control.Monad.State
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
-import Debug.Trace
-
 type InferMap = Map.Map Word64 Type
 
 data InferData = Inf
@@ -258,11 +256,11 @@ getLocals (x ::: t) = do
     TVar name -> modify (Set.insert name)
     _ -> return ()
   case x of
+    Val (Func xs expr) -> sequence (map locName xs) >> getLocals expr
     Op _ a b -> getLocals a >> getLocals b
     App a b -> getLocals a >> getLocals b
     If i t e -> getLocals i >> getLocals t >> getLocals e
     Let name val expr -> locName name >> getLocals val >> getLocals expr
-    Func xs expr -> sequence (map locName xs) >> getLocals expr
     _ -> return ()
   where
     locName :: Typed Name -> State (Set.Set String) ()
@@ -292,17 +290,24 @@ instance TypeMap Name where
   verifyTypes _ = Right ()
 
 instance TypeMap Expr where
+  mapTypes f (Val v) = Val (mapTypes f v)
   mapTypes f (Op op a b) = Op op (mapTypes f a) (mapTypes f b)
   mapTypes f (App a b) = App (mapTypes f a) (mapTypes f b)
   mapTypes f (If i t e) = If (mapTypes f i) (mapTypes f t) (mapTypes f e)
   mapTypes f (Let name val expr) = Let (mapTypes f name) (mapTypes f val) (mapTypes f expr)
-  mapTypes f (Func xs expr) = Func (map (mapTypes f) xs) (mapTypes f expr)
   mapTypes _ other = other
 
+  verifyTypes (Val v) = verifyTypes v
   verifyTypes (Op _ a b) = verifyTypes a >> verifyTypes b
   verifyTypes (App a b) = verifyTypes a >> verifyTypes b
   verifyTypes (If i t e) = verifyTypes i >> verifyTypes t >> verifyTypes e
   verifyTypes (Let name val expr) = verifyTypes name >> verifyTypes val >> verifyTypes expr
+  verifyTypes _ = Right ()
+
+instance TypeMap Value where
+  mapTypes f (Func xs expr) = Func (map (mapTypes f) xs) (mapTypes f expr)
+  mapTypes _ other = other
+
   verifyTypes (Func xs expr) = do
     sequence $ map verifyTypes xs
     verifyTypes expr
@@ -311,8 +316,12 @@ instance TypeMap Expr where
 ty :: Globals -> Env Type -> Typed Expr -> InferState Type
 ty glob env (x ::: fin) = do
   case x of
-    Lit (Nat _) -> unify fin tNat
-    Lit (Bool _) -> unify fin tBool
+    Val (Nat _) -> unify fin tNat
+    Val (Bool _) -> unify fin tBool
+    Val (Func xs expr) -> do
+      let types = map (\(n ::: t) -> (n, t)) xs
+      res <- ty glob (reverse types ++ env) expr
+      unify fin $ mkFuncTy (map typeof xs) res
     Id name -> do
       ty <-
         case Map.lookup name (globalVariables glob) of
@@ -348,10 +357,6 @@ ty glob env (x ::: fin) = do
       unify v ex
       e <- ty glob ((name, v):env) expr
       unify fin e
-    Func xs expr -> do
-      let types = map (\(n ::: t) -> (n, t)) xs
-      res <- ty glob (reverse types ++ env) expr
-      unify fin $ mkFuncTy (map typeof xs) res
   return fin
 
 simplify :: InferMap -> Type -> Type

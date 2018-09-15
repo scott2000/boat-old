@@ -33,7 +33,7 @@ import Debug.Trace -- TODO remove
 
 data Codegen = Codegen
   { anonymousFunctions :: [ClosureData],
-    values :: Env Value,
+    values :: Env (Typed Value),
     getWordSize :: Word32,
     getMalloc :: Maybe Operand }
 
@@ -50,56 +50,67 @@ data ClosureData = ClosureData
 type BuilderState = StateT Codegen ModuleBuilder
 type Builder = IRBuilderT BuilderState
 
-newCodegen :: Word32 -> Codegen
-newCodegen wordSize = Codegen
+newCodegen :: Env (Typed Value) -> Word32 -> Codegen
+newCodegen values wordSize = Codegen
   { anonymousFunctions = [],
-    values = [],
+    values = values,
     getWordSize = wordSize,
     getMalloc = Nothing }
 
 allValues :: BuilderState [Name]
 allValues = (map fst) <$> (gets values)
 
-testCompile :: Env (Typed Expr) -> Word32 -> IO ()
+testCompile :: Env (Typed Value) -> Word32 -> IO ()
 testCompile env wordSize =
   putStrLn
   $ unpack
   $ ppllvm
   $ buildModule "test"
-  $ flip evalStateT (newCodegen wordSize)
+  $ flip evalStateT (newCodegen env wordSize)
   $ genAllVals env
   -- $ (genAllVals env >>
   -- getStaticClosureData
   --   [Name "y" ::: tNat]
   --   (Op "+" (Id (Name "x") ::: tNat) (Id (Name "y") ::: tNat) ::: tNat))
 
-genAllVals :: Env (Typed Expr) -> BuilderState (Env Operand)
+genAllVals :: Env (Typed Value) -> BuilderState (Env Operand)
 genAllVals env = do
   wordSize <- gets getWordSize
   malloc <- extern "malloc" [LLVM.IntegerType wordSize] (ptr i8)
   modify $ \s -> s { getMalloc = Just malloc }
   sequence $ map genValFunc env
 
-genValFunc :: (Name, Typed Expr) -> BuilderState (Name, Operand)
-genValFunc (name, expr) =
+genValFunc :: (Name, Typed Value) -> BuilderState (Name, Operand)
+genValFunc (name, val) =
   let
     name' = fromString $ show name
-    ty = genTy $ typeof expr
+    ty = genTy $ typeof val
     generator _ = do
       block `named` "entry"
-      genExpr [] expr `named` "ret" >>= ret
+      genVal [] (valof val) `named` "ret" >>= ret
   in do
     f <- function name' [] ty generator
     return (name, f)
 
+evalExpr :: Typed Expr -> BuilderState Value
+evalExpr (expr ::: ty) =
+  case expr of
+    Val v -> return v
+    Id name -> fail "unimplemented: value lookup"
+    _ -> error "..."
+
 genExpr :: [(Name, Operand)] -> Typed Expr -> Builder Operand
 genExpr env (expr ::: ty) =
   case expr of
-    Lit l -> genLit l
-    Id name ->
-      case lookup name env of
-        Just x -> return x
-        Nothing -> fail ("cannot find name `" ++ show name ++ "`")
+    Val v -> genVal env v
+    Id name -> do
+      values <- lift $ gets values
+      case lookup name values of
+        Just (x ::: _) -> genVal [] x
+        Nothing ->
+          case lookup name env of
+            Just x -> return x
+            Nothing -> fail ("cannot find name `" ++ show name ++ "`")
     Op op a b -> do
       a <- genExpr env a `named` "lhs"
       b <- genExpr env b `named` "rhs"
@@ -116,8 +127,6 @@ genExpr env (expr ::: ty) =
     Let (name ::: _) val expr -> do
       val <- genExpr env val `named` (fromString $ show name)
       genExpr ((name, val):env) expr
-    Func xs expr ->
-      lift (getStaticClosureData xs expr) >>= genClosureForData env
 
 genTy :: Type -> LLVM.Type
 genTy (TId "Nat") = i64
@@ -136,10 +145,11 @@ voidFuncTy = LLVM.FunctionType void [] False
 destructorTy :: LLVM.Type
 destructorTy = LLVM.FunctionType void [ptr i8] False
 
-genLit :: Literal -> Builder Operand
-genLit (Nat n) = int64 (toInteger n)
-genLit (Bool False) = bit 0
-genLit (Bool True) = bit 1
+genVal :: [(Name, Operand)] -> Value -> Builder Operand
+genVal _ (Nat n) = int64 (toInteger n)
+genVal _ (Bool False) = bit 0
+genVal _ (Bool True) = bit 1
+genVal env (Func xs expr) = lift (getStaticClosureData xs expr) >>= genClosureForData env
 
 genIf :: Operand -> Builder Operand -> Builder Operand -> Builder Operand
 genIf i t e = mdo
@@ -175,6 +185,7 @@ getFreeNames env expr = do
     deps :: [Name] -> Typed Expr -> State [Typed Name] ()
     deps env (expr ::: ty) =
       case expr of
+        Val (Func params expr) -> deps (map valof params ++ env) expr
         Id name ->
           if name `elem` env then
             return ()
@@ -184,7 +195,6 @@ getFreeNames env expr = do
         App a b -> deps env a >> deps env b
         If i t e -> deps env i >> deps env t >> deps env e
         Let name val expr -> deps env val >> deps (valof name : env) expr
-        Func params expr -> deps (map valof params ++ env) expr
         _ -> return ()
 
 getStaticClosureData :: [Typed Name] -> Typed Expr -> BuilderState ClosureData

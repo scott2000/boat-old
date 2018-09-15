@@ -30,9 +30,9 @@ exprParserPartial = try paren
   <|> try (typed letbinding)
   <|> try (typed ifThenElse)
   <|> try (typed (Id <$> name))
-  <|> try (symbol $ key "true" >> return (Lit (Bool True) ::: tBool))
-  <|> try (symbol $ key "false" >> return (Lit (Bool False) ::: tBool))
-  <|> (::: tNat) <$> Lit <$> Nat <$> number
+  <|> try (symbol $ key "true" >> return (Val (Bool True) ::: tBool))
+  <|> try (symbol $ key "false" >> return (Val (Bool False) ::: tBool))
+  <|> (::: tNat) <$> Val <$> Nat <$> number
 
 exprParserPrec :: (Prec, Assoc) -> Parser (Typed Expr)
 exprParserPrec = exprParserBase exprParserPartial
@@ -87,7 +87,7 @@ function = do
   expr <- exprParser
   case vars of
     [] -> fail "functions must have at least one parameter (\\ -> ... is not allowed)"
-    xs -> return (Func xs expr) <?> "function literal"
+    xs -> return (Val (Func xs expr)) <?> "function literal"
   where
     someIdents = do
       ident <- typed name
