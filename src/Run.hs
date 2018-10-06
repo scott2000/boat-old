@@ -55,10 +55,10 @@ run (expr ::: ty) =
     Val v -> return (v ::: ty)
     Id name -> getValue name
     Op op a b -> do
-      (_, _, f) <- lift $ getOp op
+      (_, r, f) <- lift $ getOp op
       (a ::: _) <- run a
       (b ::: _) <- run b
-      (::: ty) <$> lift (f a b)
+      (::: r) <$> lift (f a b)
     App a b -> do
       f <- run a
       x <- run b

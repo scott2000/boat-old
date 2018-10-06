@@ -11,6 +11,8 @@ import Control.Monad.State
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
+import Debug.Trace -- TODO Remove
+
 type InferMap = Map.Map Word64 Type
 
 data InferData = Inf
@@ -52,6 +54,7 @@ inferAll count globals = do
   (count, inferred) <- inferEach count values Map.empty []
   quantified <- sequence $ map (quantifyVerify 0) inferred
   let funcDeps = depList False quantified
+  traceM ("funcDeps = " ++ show funcDeps)
   checkRecursiveDeps funcDeps
   return quantified
   where
@@ -152,28 +155,28 @@ depList lam = map helper
   where
     helper (name, expr) = (name, execState (deps lam [] expr) Set.empty)
 
+type DepState = StateT [DepEntry] (Either String)
+
 checkRecursiveDeps :: [DepEntry] -> Either String ()
-checkRecursiveDeps = helper []
+checkRecursiveDeps allDeps = sequence_ (map helper allDeps)
   where
-    showName name = "`" ++ show name ++ "`"
-    helper _ [] = Right ()
-    helper l ((name, deps):xs) =
-      let newL = name:l in
-      case deny [] newL deps of
-        [] -> helper newL xs
-        [x] -> Left (
-          "infinite loop in top level value: "
-          ++ showName x
-          ++ " directly uses itself")
-        err@(x:_) ->
-          Left (
-            "infinite loop in top level values: ("
-            ++ intercalate " => " (map show (err ++ [x]))
-            ++ " => ...)")
-    deny _ [] deps = []
-    deny list (x:xs) deps
-      | x `elem` deps = x:list
-      | otherwise = deny (x:list) xs deps
+    helper (name, deps) = check [] (Set.toList deps)
+    check parents [] = Right ()
+    check parents (x:xs) =
+      case untilElem [x] x parents of
+        [] -> do
+          check parents xs
+          check (x:parents) (Set.toList (fromJust (lookup x allDeps)))
+        list -> Left ("infinite loop in top level values: " ++ intercalate " => " (map show list))
+    untilElem list target [] = []
+    untilElem list target (x:xs)
+      | x == target = list'
+      | otherwise = untilElem list' target xs
+      where
+        list' = x:list
+
+showName :: Name -> String
+showName name = '`' : show name ++ "`"
 
 type AliasMode = Type -> State (Word64, Map.Map Word64 Type, Map.Map String Type) Type
 
