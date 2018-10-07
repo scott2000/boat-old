@@ -1,6 +1,7 @@
-module Run (evaluateAll, evaluate, embed) where
+module Run (getInstanceOfValue, evaluateAll, evaluate, embed) where
 
 import AST
+import Infer (TypeMap (mapTypes))
 
 import Data.Word
 import Data.Maybe
@@ -15,6 +16,21 @@ data PossibleValue
   = Unevaluated (Typed Expr)
   | Evaluated (Typed Value)
   | InProgress
+
+getInstanceOfValue :: Type -> Typed Value -> Typed Value
+getInstanceOfValue targetTy val =
+  mapTypes subs val
+  where
+    subsMap = matchTypes Map.empty targetTy (typeof val)
+    subs (TVar v) = fromJust (Map.lookup v subsMap)
+    subs (TFunc a b) = TFunc (subs a) (subs b)
+    subs other = other
+    matchTypes m target (TVar v)
+      | Map.member v m = m
+      | otherwise    = Map.insert v target m
+    matchTypes m (TFunc a0 b0) (TFunc a1 b1) =
+      matchTypes (matchTypes m a0 a1) b0 b1
+    matchTypes m _ _ = m
 
 type RunState = StateT (Map.Map Name PossibleValue) (Either String)
 
@@ -53,7 +69,7 @@ run :: Typed Expr -> RunState (Typed Value)
 run (expr ::: ty) =
   case expr of
     Val v -> return (v ::: ty)
-    Id name -> getValue name
+    Id name -> (getInstanceOfValue ty) <$> getValue name
     Op op a b -> do
       (_, r, f) <- lift $ getOp op
       (a ::: _) <- run a

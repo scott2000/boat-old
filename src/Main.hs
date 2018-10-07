@@ -45,7 +45,7 @@ startCompile path = do
           case evaluateAll inferred of
             Left err -> putStrLn ("ERROR: " ++ err)
             Right evaluated -> do
-              putStr $ unlines $ map (\(n,x) -> show n ++ " = " ++ show x) evaluated
+              putStr $ unlines $ map (\(n,x) -> show n ++ " : " ++ show (typeof x) ++ " = " ++ show x) evaluated
               header "compiled"
               testCompile evaluated 64
   where

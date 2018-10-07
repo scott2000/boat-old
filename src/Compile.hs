@@ -4,7 +4,7 @@
 module Compile (testCompile) where
 
 import AST
-import Infer (TypeMap (mapTypes))
+import Run (getInstanceOfValue)
 
 import qualified LLVM.AST as LLVM
 import qualified LLVM.AST.Typed as LLVM
@@ -29,8 +29,6 @@ import Control.Monad.State hiding (void)
 import Data.Text.Lazy (unpack)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-
-import Debug.Trace -- TODO remove
 
 data Codegen = Codegen
   { anonymousFunctions :: [ClosureData],
@@ -57,22 +55,6 @@ newCodegen values wordSize = Codegen
     values = values,
     getWordSize = wordSize,
     getMalloc = Nothing }
-
-getInstanceOfValue :: Type -> Typed Value -> Typed Value
-getInstanceOfValue targetTy val =
-  mapTypes subs val
-  where
-    subsMap = matchTypes Map.empty targetTy (typeof val)
-    subs (TVar v) = fromJust (Map.lookup v subsMap)
-    subs (TFunc a b) = TFunc (subs a) (subs b)
-    subs other = other
-    matchTypes m target (TVar v)
-      | Map.member v m = m
-      | otherwise    = Map.insert v target m
-    matchTypes m (TFunc a0 b0) (TFunc a1 b1) =
-      matchTypes (matchTypes m a0 a1) b0 b1
-    matchTypes m _ _ = m
-
 
 allValues :: BuilderState [Name]
 allValues = (map fst) <$> (gets values)
@@ -106,43 +88,42 @@ genMain main = do
     ty = genTy $ typeof main
     generator _ = do
       block `named` "entry"
-      genVal [] (valof main) `named` "ret" >>= ret
+      genVal [] [] (valof main) `named` "ret" >>= ret
 
-evalExpr :: Typed Expr -> BuilderState Value -- TODO Remove this?
-evalExpr (expr ::: ty) =
+genExpr :: [Operand] -> [(Name, Operand)] -> Typed Expr -> Builder Operand
+genExpr app env (expr ::: ty) =
   case expr of
-    Val v -> return v
-    Id name -> fail "unimplemented: value lookup"
-    _ -> error "..."
-
-genExpr :: [(Name, Operand)] -> Typed Expr -> Builder Operand
-genExpr env (expr ::: ty) =
-  case expr of
-    Val v -> genVal env v
+    Val v -> genVal app env v
+    App a b -> do
+      arg <- genExpr [] env b `named` "app.arg"
+      genExpr (arg:app) env a `named` "app.func"
     Id name -> do
       values <- lift $ gets values
       case lookup name values of
-        Just val -> genVal [] $ valof $ getInstanceOfValue ty val
+        Just val -> genVal app [] $ valof $ getInstanceOfValue ty val
         Nothing ->
           case lookup name env of
-            Just x -> return x
+            Just x -> genApp app x
             Nothing -> fail ("cannot find name `" ++ show name ++ "`")
     Op op a b -> do
-      a <- genExpr env a `named` "lhs"
-      b <- genExpr env b `named` "rhs"
-      genOp op a b
-    App a b -> do
-      a <- genExpr env a `named` "app.func"
-      b <- genExpr env b `named` "app.arg"
-      case ty of
-        TFunc _ _ -> genCallClosure a b
-        _ -> genCallClosureNF (genTy ty) a b
+      a <- genExpr [] env a `named` "lhs"
+      b <- genExpr [] env b `named` "rhs"
+      r <- genOp op a b
+      genApp app r
     If i t e -> do
-      i <- genExpr env i `named` "if.cond"
-      genIf i (genExpr env t) (genExpr env e)
+      i <- genExpr [] env i `named` "if.cond"
+      genIf i (genExpr app env t) (genExpr app env e)
     Let (name ::: _) val expr -> do
-      val <- genExpr env val `named` (fromString $ show name)
-      genExpr ((name, val):env) expr
+      val <- genExpr [] env val `named` (fromString $ show name)
+      genExpr app ((name, val):env) expr
+
+genStaticCall :: [Operand] -> ClosureData -> Builder Operand
+genStaticCall args closureData =
+  call (getFunc closureData) (map (\x -> (x, [])) args) `named` "call.static"
+
+genApp :: [Operand] -> Operand -> Builder Operand
+genApp [] val = return val
+genApp app closure = error ("non-static: " ++ show app ++ " in " ++ show closure)
 
 genTy :: Type -> LLVM.Type
 genTy (TId "Nat") = i64
@@ -161,11 +142,17 @@ voidFuncTy = LLVM.FunctionType void [] False
 destructorTy :: LLVM.Type
 destructorTy = LLVM.FunctionType void [ptr i8] False
 
-genVal :: [(Name, Operand)] -> Value -> Builder Operand
-genVal _ (Nat n) = int64 (toInteger n)
-genVal _ (Bool False) = bit 0
-genVal _ (Bool True) = bit 1
-genVal env (Func xs expr) = lift (getStaticClosureData xs expr) >>= genClosureForData env
+genVal :: [Operand] -> [(Name, Operand)] -> Value -> Builder Operand
+genVal [] _ (Nat n) = int64 (toInteger n)
+genVal [] _ (Bool False) = bit 0
+genVal [] _ (Bool True) = bit 1
+genVal app env (Func xs expr) = do
+  closureData <- lift (getStaticClosureData xs expr)
+  if length (getParameters closureData) == length app then
+    genStaticCall app closureData
+  else do
+    closure <- genClosureForData env closureData
+    genApp app closure
 
 genIf :: Operand -> Builder Operand -> Builder Operand -> Builder Operand
 genIf i t e = mdo
@@ -300,7 +287,7 @@ buildStaticClosure free params expr = mdo
     combinedArgs = free ++ params
     body args = do
       block `named` "entry"
-      expr <- genExpr env expr `named` "ret"
+      expr <- genExpr [] env expr `named` "ret"
       ret expr
       where
         env = zipWith (\p a -> (valof p, a)) combinedArgs args
