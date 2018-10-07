@@ -1,4 +1,4 @@
-module Infer (inferAll, simplify, TypeMap(..)) where
+module Infer (inferAll, simplify, TypeMap (mapTypes)) where
 
 import AST
 
@@ -10,8 +10,6 @@ import Control.Applicative
 import Control.Monad.State
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-
-import Debug.Trace -- TODO Remove
 
 type InferMap = Map.Map Word64 Type
 
@@ -54,7 +52,6 @@ inferAll count globals = do
   (count, inferred) <- inferEach count values Map.empty []
   quantified <- sequence $ map (quantifyVerify 0) inferred
   let funcDeps = depList False quantified
-  traceM ("funcDeps = " ++ show funcDeps)
   checkRecursiveDeps funcDeps
   return quantified
   where
@@ -126,9 +123,10 @@ tsort deps = helper [] deps
   where
     helper acc deps
       | null a = next
-      | otherwise = helper next newDeps
-      where
-        (a, b) = roots deps
+      | null b = next ++ map fst a      -- This case is called when there is an invalid value
+      | otherwise = helper next newDeps -- which breaks the topological sorting algorithm
+      where                             --   TODO: Add a check earlier in the process for invalid
+        (a, b) = roots deps             --         identifier names
         next = acc ++ b
         newDeps = foldr removeName a $ concat $ map Set.toList b
     roots [] = ([], [])

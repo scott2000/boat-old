@@ -4,6 +4,7 @@
 module Compile (testCompile) where
 
 import AST
+import Infer (TypeMap (mapTypes))
 
 import qualified LLVM.AST as LLVM
 import qualified LLVM.AST.Typed as LLVM
@@ -57,42 +58,57 @@ newCodegen values wordSize = Codegen
     getWordSize = wordSize,
     getMalloc = Nothing }
 
+getInstanceOfValue :: Type -> Typed Value -> Typed Value
+getInstanceOfValue targetTy val =
+  mapTypes subs val
+  where
+    subsMap = matchTypes Map.empty targetTy (typeof val)
+    subs (TVar v) = fromJust (Map.lookup v subsMap)
+    subs (TFunc a b) = TFunc (subs a) (subs b)
+    subs other = other
+    matchTypes m target (TVar v)
+      | Map.member v m = m
+      | otherwise    = Map.insert v target m
+    matchTypes m (TFunc a0 b0) (TFunc a1 b1) =
+      matchTypes (matchTypes m a0 a1) b0 b1
+    matchTypes m _ _ = m
+
+
 allValues :: BuilderState [Name]
 allValues = (map fst) <$> (gets values)
 
 testCompile :: Env (Typed Value) -> Word32 -> IO ()
 testCompile env wordSize =
-  putStrLn
-  $ unpack
-  $ ppllvm
-  $ buildModule "test"
-  $ flip evalStateT (newCodegen env wordSize)
-  $ genAllVals env
-  -- $ (genAllVals env >>
-  -- getStaticClosureData
-  --   [Name "y" ::: tNat]
-  --   (Op "+" (Id (Name "x") ::: tNat) (Id (Name "y") ::: tNat) ::: tNat))
+  case lookup (Name "main") env of
+    Nothing -> putStrLn "no `main` value found"
+    Just main
+      | notConcrete (typeof main) ->
+        putStrLn ("`main` value has generic type: " ++ show (typeof main))
+      | otherwise ->
+        putStrLn
+        $ unpack
+        $ ppllvm
+        $ buildModule "test"
+        $ evalStateT (genMain main)
+        $ newCodegen env wordSize
+  where
+    notConcrete (TId _) = False
+    notConcrete (TFunc a b) = notConcrete a || notConcrete b
+    notConcrete _ = True
 
-genAllVals :: Env (Typed Value) -> BuilderState (Env Operand)
-genAllVals env = do
+genMain :: Typed Value -> BuilderState Operand
+genMain main = do
   wordSize <- gets getWordSize
   malloc <- extern "malloc" [LLVM.IntegerType wordSize] (ptr i8)
   modify $ \s -> s { getMalloc = Just malloc }
-  sequence $ map genValFunc env
-
-genValFunc :: (Name, Typed Value) -> BuilderState (Name, Operand)
-genValFunc (name, val) =
-  let
-    name' = fromString $ show name
-    ty = genTy $ typeof val
+  function "main" [] ty generator
+  where
+    ty = genTy $ typeof main
     generator _ = do
       block `named` "entry"
-      genVal [] (valof val) `named` "ret" >>= ret
-  in do
-    f <- function name' [] ty generator
-    return (name, f)
+      genVal [] (valof main) `named` "ret" >>= ret
 
-evalExpr :: Typed Expr -> BuilderState Value
+evalExpr :: Typed Expr -> BuilderState Value -- TODO Remove this?
 evalExpr (expr ::: ty) =
   case expr of
     Val v -> return v
@@ -106,7 +122,7 @@ genExpr env (expr ::: ty) =
     Id name -> do
       values <- lift $ gets values
       case lookup name values of
-        Just (x ::: _) -> genVal [] x
+        Just val -> genVal [] $ valof $ getInstanceOfValue ty val
         Nothing ->
           case lookup name env of
             Just x -> return x
