@@ -34,7 +34,8 @@ data Codegen = Codegen
   { anonymousFunctions :: [ClosureData],
     values :: Env (Typed Value),
     getWordSize :: Word32,
-    getMalloc :: Maybe Operand }
+    getMalloc :: Maybe Operand,
+    getFunctionName :: String }
 
 data ClosureData = ClosureData
   { getClosureIndex :: !Int,
@@ -54,10 +55,21 @@ newCodegen values wordSize = Codegen
   { anonymousFunctions = [],
     values = values,
     getWordSize = wordSize,
-    getMalloc = Nothing }
+    getMalloc = Nothing,
+    getFunctionName = "main" }
 
 allValues :: BuilderState [Name]
 allValues = (map fst) <$> (gets values)
+
+inVal :: Builder a -> String -> Builder a
+inVal builder name' = do
+  s <- lift get
+  let name = getFunctionName s
+  put (s { getFunctionName = name' })
+  r <- builder
+  s' <- lift get
+  put (s' { getFunctionName = name })
+  return r
 
 testCompile :: Env (Typed Value) -> Word32 -> IO ()
 testCompile env wordSize =
@@ -88,28 +100,29 @@ genMain main = do
     ty = genTy $ typeof main
     generator _ = do
       block `named` "entry"
-      genVal [] [] (valof main) `named` "ret" >>= ret
+      genVal [] [] main `named` "ret" >>= ret
 
 genExpr :: [Operand] -> [(Name, Operand)] -> Typed Expr -> Builder Operand
 genExpr app env (expr ::: ty) =
   case expr of
-    Val v -> genVal app env v
+    Val v -> genVal app env (v ::: ty)
     App a b -> do
       arg <- genExpr [] env b `named` "app.arg"
       genExpr (arg:app) env a `named` "app.func"
     Id name -> do
       values <- lift $ gets values
       case lookup name values of
-        Just val -> genVal app [] $ valof $ getInstanceOfValue ty val
+        Just val -> do
+          genVal app [] (getInstanceOfValue ty val) `inVal` (show name)
         Nothing ->
           case lookup name env of
-            Just x -> genApp app x
+            Just x -> genApp ty app x
             Nothing -> fail ("cannot find name `" ++ show name ++ "`")
     Op op a b -> do
       a <- genExpr [] env a `named` "lhs"
       b <- genExpr [] env b `named` "rhs"
       r <- genOp op a b
-      genApp app r
+      genApp ty app r
     If i t e -> do
       i <- genExpr [] env i `named` "if.cond"
       genIf i (genExpr app env t) (genExpr app env e)
@@ -121,9 +134,15 @@ genStaticCall :: [Operand] -> ClosureData -> Builder Operand
 genStaticCall args closureData =
   call (getFunc closureData) (map (\x -> (x, [])) args) `named` "call.static"
 
-genApp :: [Operand] -> Operand -> Builder Operand
-genApp [] val = return val
-genApp app closure = error ("non-static: " ++ show app ++ " in " ++ show closure)
+-- TODO: Reference counting updates for chained calls
+genApp :: Type -> [Operand] -> Operand -> Builder Operand
+genApp _  [] val = return val
+genApp (TFunc _ (TFunc _ _)) [arg] closure =
+  genCallClosure closure arg
+genApp (TFunc _ ty) [arg] closure =
+  genCallClosureNF (genTy ty) closure arg
+genApp (TFunc _ ty) (arg:rest) closure =
+  genCallClosure closure arg >>= genApp ty rest
 
 genTy :: Type -> LLVM.Type
 genTy (TId "Nat") = i64
@@ -142,17 +161,17 @@ voidFuncTy = LLVM.FunctionType void [] False
 destructorTy :: LLVM.Type
 destructorTy = LLVM.FunctionType void [ptr i8] False
 
-genVal :: [Operand] -> [(Name, Operand)] -> Value -> Builder Operand
-genVal [] _ (Nat n) = int64 (toInteger n)
-genVal [] _ (Bool False) = bit 0
-genVal [] _ (Bool True) = bit 1
-genVal app env (Func xs expr) = do
+genVal :: [Operand] -> [(Name, Operand)] -> Typed Value -> Builder Operand
+genVal [] _ (Nat n ::: _) = int64 (toInteger n)
+genVal [] _ (Bool False ::: _) = bit 0
+genVal [] _ (Bool True ::: _) = bit 1
+genVal app env (Func xs expr ::: ty) = do
   closureData <- lift (getStaticClosureData xs expr)
   if length (getParameters closureData) == length app then
     genStaticCall app closureData
   else do
     closure <- genClosureForData env closureData
-    genApp app closure
+    genApp ty app closure
 
 genIf :: Operand -> Builder Operand -> Builder Operand -> Builder Operand
 genIf i t e = mdo
@@ -217,11 +236,12 @@ getStaticClosureData params expr = do
 
 buildStaticClosure :: [Typed Name] -> [Typed Name] -> Typed Expr -> BuilderState ClosureData
 buildStaticClosure free params expr = mdo
-  anons <- gets anonymousFunctions
-  modify (\codegen -> codegen { anonymousFunctions = result : anons })
+  codegen <- get
   let
+    anons = anonymousFunctions codegen
+    currentValue = getFunctionName codegen
     len = length anons
-    infoName = fromString ("info." ++ show len)
+    infoName = fromString ("info." ++ currentValue ++ "." ++ show len)
     fwdType = LLVM.FunctionType returnType [ptr i8, genTy $ typeof $ last params] False
     def = LLVM.GlobalVariable
       infoName
@@ -241,9 +261,10 @@ buildStaticClosure free params expr = mdo
       0
       []
     paramType (Name name ::: ty) = (genTy ty, fromString name)
-    funcName = fromString ("func." ++ show len)
-    fwdName = fromString ("fwd." ++ show len)
+    funcName = fromString ("func." ++ currentValue ++ "." ++ show len)
+    fwdName = fromString ("fwd." ++ currentValue ++ "." ++ show len)
     returnType = genTy $ typeof expr
+  put (codegen { anonymousFunctions = result : anons })
   emitDefn (LLVM.GlobalDefinition def)
   func <- function funcName (map paramType combinedArgs) returnType body
   let
