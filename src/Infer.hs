@@ -317,6 +317,7 @@ instance TypeMap Value where
 ty :: Globals -> Env Type -> Typed Expr -> InferState Type
 ty glob env (x ::: fin) = do
   case x of
+    Val Unit -> unify fin tUnit
     Val (Nat _) -> unify fin tNat
     Val (Bool _) -> unify fin tBool
     Val (Func xs expr) -> do

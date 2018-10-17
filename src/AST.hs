@@ -16,6 +16,7 @@ module AST
     zipEnv,
     getOp,
     mkFuncTy,
+    tUnit,
     tNat,
     tBool )
   where
@@ -47,7 +48,8 @@ data Typed a = (:::)
   deriving Eq
 
 data Value
-  = Nat Word64
+  = Unit
+  | Nat Word64
   | Bool Bool
   | Func [Typed Name] (Typed Expr)
   deriving Eq
@@ -80,6 +82,7 @@ instance Show a => Show (Typed a) where
   show (x ::: _) = show x
 
 instance Show Value where
+  show Unit = "unit"
   show (Nat n) = show n
   show (Bool True) = "true"
   show (Bool False) = "false"
@@ -196,7 +199,7 @@ opList =
     c "==" (==),
     c "!=" (/=),
     b "||" (||),
-    b "&&" (&&) ]
+    b "&&" (&&)]
   where
     n s op = (s, (tNat, tNat, f))
       where
@@ -228,6 +231,9 @@ tyString s =
     TId s
   else
     TVar s
+
+tUnit :: Type
+tUnit = TId "Unit"
 
 tNat :: Type
 tNat = TId "Nat"

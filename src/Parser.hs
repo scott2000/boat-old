@@ -30,6 +30,7 @@ exprParserPartial = try paren
   <|> try (typed letbinding)
   <|> try (typed ifThenElse)
   <|> try (typed (Id <$> name))
+  <|> try (symbol $ key "unit" >> return (Val Unit ::: tUnit))
   <|> try (symbol $ key "true" >> return (Val (Bool True) ::: tBool))
   <|> try (symbol $ key "false" >> return (Val (Bool False) ::: tBool))
   <|> (::: tNat) <$> Val <$> Nat <$> number
@@ -116,7 +117,7 @@ paren = do
   return expr
 
 keywords :: [String]
-keywords = ["val", "let", "in", "true", "false", "if", "then", "else"]
+keywords = ["val", "let", "in", "unit", "true", "false", "if", "then", "else"]
 
 data OpKind
   = Wide

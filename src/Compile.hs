@@ -35,6 +35,8 @@ data Codegen = Codegen
     values :: Env (Typed Value),
     getWordSize :: Word32,
     getMalloc :: Maybe Operand,
+    getPuts :: Maybe Operand,
+    getStringCount :: !Int,
     getFunctionName :: String }
 
 data ClosureData = ClosureData
@@ -56,6 +58,8 @@ newCodegen values wordSize = Codegen
     values = values,
     getWordSize = wordSize,
     getMalloc = Nothing,
+    getPuts = Nothing,
+    getStringCount = 0,
     getFunctionName = "main" }
 
 allValues :: BuilderState [Name]
@@ -93,14 +97,15 @@ testCompile env wordSize =
 genMain :: Typed Value -> BuilderState Operand
 genMain main = do
   wordSize <- gets getWordSize
-  malloc <- extern "malloc" [LLVM.IntegerType wordSize] (ptr i8)
-  modify $ \s -> s { getMalloc = Just malloc }
-  function "main" [] ty generator
+  function "main" [] (genTy retType) generator
   where
-    ty = genTy $ typeof main
     generator _ = do
       block `named` "entry"
-      genVal [] [] main `named` "ret" >>= ret
+      genVal mainArgs [] main `named` "ret" >>= ret
+    (retType, mainArgs) =
+      case typeof main of
+        TFunc (TId "Unit") r -> (r, [unit])
+        r -> (r, [])
 
 genExpr :: [Operand] -> [(Name, Operand)] -> Typed Expr -> Builder Operand
 genExpr app env (expr ::: ty) =
@@ -145,9 +150,13 @@ genApp (TFunc _ ty) (arg:rest) closure =
   genCallClosure closure arg >>= genApp ty rest
 
 genTy :: Type -> LLVM.Type
+genTy (TId "Unit") = unitTy
 genTy (TId "Nat") = i64
 genTy (TId "Bool") = i1
 genTy (TFunc _ _) = funcTy
+
+unitTy :: LLVM.Type
+unitTy = LLVM.StructureType False []
 
 funcTy :: LLVM.Type
 funcTy = LLVM.StructureType False [ptr infoTy, i32, ptr i8]
@@ -162,6 +171,7 @@ destructorTy :: LLVM.Type
 destructorTy = LLVM.FunctionType void [ptr i8] False
 
 genVal :: [Operand] -> [(Name, Operand)] -> Typed Value -> Builder Operand
+genVal [] _ (Unit ::: _) = return unit
 genVal [] _ (Nat n ::: _) = int64 (toInteger n)
 genVal [] _ (Bool False ::: _) = bit 0
 genVal [] _ (Bool True ::: _) = bit 1
@@ -172,6 +182,9 @@ genVal app env (Func xs expr ::: ty) = do
   else do
     closure <- genClosureForData env closureData
     genApp ty app closure
+
+unit :: Operand
+unit = LLVM.ConstantOperand (C.Struct Nothing False [])
 
 genIf :: Operand -> Builder Operand -> Builder Operand -> Builder Operand
 genIf i t e = mdo
@@ -387,9 +400,56 @@ genStruct operands = iter 0 operands $ LLVM.ConstantOperand $ C.Struct Nothing F
 
 malloc :: LLVM.Type -> Builder (Operand, Operand)
 malloc ty = do
-  Just malloc <- lift $ gets getMalloc
-  wordSize <- gets getWordSize
+  s <- lift get
+  let wordSize = getWordSize s
+  malloc <- case getMalloc s of
+    Nothing -> do
+      malloc <- lift $ extern "malloc" [LLVM.IntegerType wordSize] (ptr i8)
+      lift $ put $ s { getMalloc = Just malloc }
+      return malloc
+    Just malloc -> return malloc
   let gep = C.GetElementPtr False (C.Null $ ptr ty) [C.Int 32 1]
   res <- call malloc [(LLVM.ConstantOperand $ C.PtrToInt gep (LLVM.IntegerType wordSize), [])] `named` "malloc.call"
   cast <- bitcast res (ptr ty) `named` "malloc.ptr"
   return (cast, res)
+
+puts :: String -> Builder ()
+puts string = do
+  s <- lift get
+  (count, puts) <- case getPuts s of
+    Nothing -> do
+      puts <- lift $ extern "puts" [ptr i8] void
+      lift $ put $ s { getStringCount = 1, getPuts = Just puts }
+      return (0, puts)
+    Just puts -> do
+      let count = getStringCount s
+      lift $ put $ s { getStringCount = count+1 }
+      return (count, puts)
+  str <- emitString count string
+  call puts [(str, [])]
+  return ()
+
+emitString :: Int -> String -> Builder Operand
+emitString count string = do
+  lift $ emitDefn (LLVM.GlobalDefinition global)
+  return (LLVM.ConstantOperand (C.BitCast (C.GlobalReference (ptr ty) name) (ptr i8)))
+  where
+    asciiString = map charToByte (string ++ "\0")
+    charToByte ch = C.Int 8 (toInteger (fromEnum ch))
+    global = LLVM.GlobalVariable
+      name
+      L.Private
+      V.Default
+      Nothing
+      Nothing
+      Nothing
+      True
+      ty
+      (AddrSpace 0)
+      (Just (C.Array i8 asciiString))
+      Nothing
+      Nothing
+      0
+      []
+    name = fromString ("str." ++ show count)
+    ty = LLVM.ArrayType (fromIntegral (length asciiString)) i8
