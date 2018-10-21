@@ -107,7 +107,7 @@ genMain main = do
         TFunc (TId "Unit") r -> (r, [unit])
         r -> (r, [])
 
-genExpr :: [Operand] -> [(Name, Operand)] -> Typed Expr -> Builder Operand
+genExpr :: [Operand] -> Env (Typed Operand) -> Typed Expr -> Builder Operand
 genExpr app env (expr ::: ty) =
   case expr of
     Val v -> genVal app env (v ::: ty)
@@ -121,25 +121,42 @@ genExpr app env (expr ::: ty) =
           genVal app [] (getInstanceOfValue ty val) `inVal` (show name)
         Nothing ->
           case lookup name env of
-            Just x -> genApp ty app x
+            Just (x ::: _) -> genApp ty app x
             Nothing -> fail ("cannot find name `" ++ show name ++ "`")
     Op op a b -> do
+      let aTy = typeof a
+      let bTy = typeof b
       a <- genExpr [] env a `named` "lhs"
       b <- genExpr [] env b `named` "rhs"
+      rcDec (-1) a aTy
+      rcDec (-1) b bTy
       r <- genOp op a b
       genApp ty app r
     If i t e -> do
+      globals <- lift allValues
+      let thenScope = countLocals globals t localEnv
+      let elseScope = countLocals globals e localEnv
+      let diffScope = zipEnv (-) thenScope elseScope
       i <- genExpr [] env i `named` "if.cond"
-      genIf i (genExpr app env t) (genExpr app env e)
-    Let (name ::: _) val expr -> do
+      genIf i (genExpr app env t) (genExpr app env e) (map fromEnv diffScope)
+    Let (name ::: ty) val expr -> do
+      globals <- lift allValues
+      let innerScope = countLocals globals expr ((name, 0) : localEnv)
+      let ((_, inc):_) = innerScope
       val <- genExpr [] env val `named` (fromString $ show name)
-      genExpr app ((name, val):env) expr
+      if inc /= 0 then rcInc inc val ty else return ()
+      genExpr app ((name, val ::: ty):env) expr
+  where
+    localEnv = toLocalEnv env
+    fromEnv (name, count) = (fromJust $ lookup name env, count)
+
+toLocalEnv :: Env (Typed Operand) -> Env Int
+toLocalEnv = map (\(x, _) -> (x, 0))
 
 genStaticCall :: [Operand] -> ClosureData -> Builder Operand
 genStaticCall args closureData =
   call (getFunc closureData) (map (\x -> (x, [])) args) `named` "call.static"
 
--- TODO: Reference counting updates for chained calls
 genApp :: Type -> [Operand] -> Operand -> Builder Operand
 genApp _  [] val = return val
 genApp (TFunc _ (TFunc _ _)) [arg] closure =
@@ -170,7 +187,16 @@ voidFuncTy = LLVM.FunctionType void [] False
 destructorTy :: LLVM.Type
 destructorTy = LLVM.FunctionType void [ptr i8] False
 
-genVal :: [Operand] -> [(Name, Operand)] -> Typed Value -> Builder Operand
+rcInc :: Int -> Operand -> Type -> Builder ()
+rcInc i o ty = puts ("inc " ++ unpack (ppll o) ++ " : " ++ show ty ++ " by " ++ show i)
+
+rcDec :: Int -> Operand -> Type -> Builder ()
+rcDec i o ty = puts ("dec " ++ unpack (ppll o) ++ " : " ++ show ty ++ " by " ++ show i)
+
+fnDec :: Builder ()
+fnDec = puts "should decrement saturated call here"
+
+genVal :: [Operand] -> Env (Typed Operand) -> Typed Value -> Builder Operand
 genVal [] _ (Unit ::: _) = return unit
 genVal [] _ (Nat n ::: _) = int64 (toInteger n)
 genVal [] _ (Bool False ::: _) = bit 0
@@ -186,17 +212,26 @@ genVal app env (Func xs expr ::: ty) = do
 unit :: Operand
 unit = LLVM.ConstantOperand (C.Struct Nothing False [])
 
-genIf :: Operand -> Builder Operand -> Builder Operand -> Builder Operand
-genIf i t e = mdo
+genIf :: Operand -> Builder Operand -> Builder Operand -> [(Typed Operand, Int)] -> Builder Operand
+genIf i t e diffs = mdo
   condBr i thenBlock elseBlock
   thenBlock <- block `named` "if.then"
+  sequence $ map thenDec diffs
   thenRes <- t `named` "if.then.res"
   br endBlock
   elseBlock <- block `named` "if.else"
+  sequence $ map elseDec diffs
   elseRes <- e `named` "if.else.res"
   br endBlock
   endBlock <- block `named` "if.end"
   phi [(thenRes, thenBlock), (elseRes, elseBlock)]
+  where
+    thenDec (o ::: ty, n)
+      | n < 0     = rcDec n o ty
+      | otherwise = return ()
+    elseDec (o ::: ty, n)
+      | n > 0     = rcDec (-n) o ty
+      | otherwise = return ()
 
 genOp :: String -> Operand -> Operand -> Builder Operand
 genOp "+" = add
@@ -251,6 +286,22 @@ buildStaticClosure :: [Typed Name] -> [Typed Name] -> Typed Expr -> BuilderState
 buildStaticClosure free params expr = mdo
   codegen <- get
   let
+    combinedArgs = free ++ params
+    body args = do
+      block `named` "entry"
+      globals <- lift allValues
+      let localScope = countLocals globals expr localEnv
+      sequence $ map localInc localScope
+      expr <- genExpr [] env expr `named` "ret"
+      ret expr
+      where
+        env = zipWith (\p a -> (valof p, a ::: typeof p)) combinedArgs args
+        localEnv = toLocalEnv env
+        localInc (name, inc)
+          | inc > 1  =
+            let (o ::: ty) = fromJust $ lookup name env in
+            rcInc (inc-1) o ty
+          | otherwise = return ()
     anons = anonymousFunctions codegen
     currentValue = getFunctionName codegen
     len = length anons
@@ -317,16 +368,8 @@ buildStaticClosure free params expr = mdo
         getFunc = func,
         getFwd = fwd }
   return result
-  where
-    combinedArgs = free ++ params
-    body args = do
-      block `named` "entry"
-      expr <- genExpr [] env expr `named` "ret"
-      ret expr
-      where
-        env = zipWith (\p a -> (valof p, a)) combinedArgs args
 
-genClosureForData :: [(Name, Operand)] -> ClosureData -> Builder Operand
+genClosureForData :: Env (Typed Operand) -> ClosureData -> Builder Operand
 genClosureForData env closureData = do
   let
     params = getParameters closureData
@@ -340,7 +383,7 @@ genClosureForData env closureData = do
         freeMap (name ::: _) n =
           case lookup name env of
             Nothing -> error ("missing capture for closure: `" ++ show name ++ "`")
-            Just res -> do
+            Just (res ::: _) -> do
               addr <- gep dataPtr [lcint 32 0, lcint 32 n] `named` "capture"
               store addr 0 res
       sequence $ zipWith freeMap frees [0..]
@@ -355,7 +398,9 @@ genCallClosureNF retType closure arg = do
   func <- load funcPtr 0 `named` "func"
   let funcTy = LLVM.FunctionType retType [ptr i8, LLVM.typeOf arg] False
   castFunc <- bitcast func (ptr funcTy) `named` "func.cast"
-  call castFunc [(dataPtr, []), (arg, [])]
+  res <- call castFunc [(dataPtr, []), (arg, [])]
+  fnDec -- TODO function dec
+  return res
 
 genCallClosure :: Operand -> Operand -> Builder Operand
 genCallClosure closure arg = mdo
@@ -363,6 +408,7 @@ genCallClosure closure arg = mdo
   dataPtr <- extractValue closure [2] `named` "data.ptr"
   isSaturated <- icmp ICMP.EQ arity (lcint 32 0) `named` "saturated"
   condBr isSaturated thenBlock elseBlock
+
   thenBlock <- block `named` "call.saturated"
   infoPtr <- extractValue closure [0] `named` "info.ptr"
   funcPtr <- gep infoPtr [lcint 32 0, lcint 32 0] `named` "func.ptr"
@@ -370,7 +416,11 @@ genCallClosure closure arg = mdo
   let castTy = LLVM.FunctionType funcTy [ptr i8, LLVM.typeOf arg] False
   castFunc <- bitcast func (ptr castTy) `named` "func.cast"
   thenRes <- call castFunc [(dataPtr, []), (arg, [])] `named` "res.sat"
+  fnDec -- TODO function dec
   br endBlock
+
+  -- For unsaturated calls, the rc doesn't need to be decremented because
+  -- the existing closure reference is stored in the new data pointer
   elseBlock <- block `named` "call.unsaturated"
   (newDataPtr, newDataPtrI8) <- malloc $ LLVM.StructureType False [LLVM.typeOf arg, ptr i8]
   argPtr <- gep newDataPtr [lcint 32 0, lcint 32 0] `named` "data.arg"
@@ -381,6 +431,7 @@ genCallClosure closure arg = mdo
   closureUpdated <- insertValue closure newArity [1] `named` "insert"
   elseRes <- insertValue closureUpdated newDataPtrI8 [2] `named` "res.unsat"
   br endBlock
+
   endBlock <- block `named` "call.end"
   phi [(thenRes, thenBlock), (elseRes, elseBlock)]
 
