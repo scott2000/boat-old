@@ -7,6 +7,7 @@ import Run
 import Compile
 
 import System.IO (hFlush, stdout, readFile)
+import System.Exit (exitFailure)
 import System.Environment (getArgs)
 import Data.Char
 import Data.Word
@@ -33,21 +34,21 @@ startCompile path = do
   header "parsed"
   let parser = runStateT manyDeclEnd 0
   case runParser parser path file of
-    Left err -> putStr ("SYNTAX ERROR: " ++ parseErrorPretty err)
+    Left err -> putStr ("SYNTAX ERROR: " ++ parseErrorPretty err) >> exitFailure
     Right (vals, nextAnon) -> do
       putStr $ unlines $ map show vals
       header "inferred"
       case inferAll nextAnon $ declToList vals of
-        Left err -> putStrLn ("TYPE ERROR: " ++ err)
+        Left err -> putStrLn ("TYPE ERROR: " ++ err) >> exitFailure
         Right inferred -> do
           putStr $ unlines $ map show $ declFromList inferred
           header "evaluate"
           case evaluateAll inferred of
-            Left err -> putStrLn ("ERROR: " ++ err)
+            Left err -> putStrLn ("ERROR: " ++ err) >> exitFailure
             Right evaluated -> do
               putStr $ unlines $ map (\(n,x) -> show n ++ " : " ++ show (typeof x) ++ " = " ++ show x) evaluated
               header "compiled"
-              testCompile evaluated 64
+              compile path evaluated 64
   where
     header x = putStrLn ("\n-- " ++ x ++ " --\n")
 

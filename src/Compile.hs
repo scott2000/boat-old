@@ -1,7 +1,7 @@
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module Compile (testCompile) where
+module Compile (compile) where
 
 import AST
 import Run (getInstanceOfValue)
@@ -9,6 +9,7 @@ import Run (getInstanceOfValue)
 import qualified LLVM.AST as LLVM
 import qualified LLVM.AST.Typed as LLVM
 import qualified LLVM.AST.Constant as C
+import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.Linkage as L
 import qualified LLVM.AST.Visibility as V
 import LLVM.AST (Operand)
@@ -20,22 +21,32 @@ import LLVM.IRBuilder.Module
 import LLVM.IRBuilder.Instruction as INST
 import LLVM.IRBuilder.Monad
 
+import LLVM.Internal.Target (withHostTargetMachine)
+import LLVM.Internal.Context (withContext)
+import LLVM.Module (withModuleFromAST, writeObjectToFile, File (..))
+
 import LLVM.Pretty
 
 import Data.Word
 import Data.Maybe
+import Data.List
 import Data.String
 import Control.Monad.State hiding (void)
 import Data.Text.Lazy (unpack)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
+type DestructorEntry = ([Type], [Type]) -- args, frees
+
 data Codegen = Codegen
   { anonymousFunctions :: [ClosureData],
     values :: Env (Typed Value),
     getWordSize :: Word32,
+    getDestructors :: Map.Map DestructorEntry C.Constant,
     getMalloc :: Maybe Operand,
+    getFree :: Maybe Operand,
     getPuts :: Maybe Operand,
+    getPrintf :: Maybe Operand,
     getStringCount :: !Int,
     getFunctionName :: String }
 
@@ -57,8 +68,11 @@ newCodegen values wordSize = Codegen
   { anonymousFunctions = [],
     values = values,
     getWordSize = wordSize,
+    getDestructors = Map.empty,
     getMalloc = Nothing,
+    getFree = Nothing,
     getPuts = Nothing,
+    getPrintf = Nothing,
     getStringCount = 0,
     getFunctionName = "main" }
 
@@ -75,33 +89,44 @@ inVal builder name' = do
   put (s' { getFunctionName = name })
   return r
 
-testCompile :: Env (Typed Value) -> Word32 -> IO ()
-testCompile env wordSize =
+compile :: String -> Env (Typed Value) -> Word32 -> IO ()
+compile path env wordSize =
   case lookup (Name "main") env of
     Nothing -> putStrLn "no `main` value found"
     Just main
       | notConcrete (typeof main) ->
         putStrLn ("`main` value has generic type: " ++ show (typeof main))
-      | otherwise ->
-        putStrLn
-        $ unpack
-        $ ppllvm
-        $ buildModule "test"
-        $ evalStateT (genMain main)
-        $ newCodegen env wordSize
+      | otherwise -> do
+        let
+          m = buildModule "test"
+            $ evalStateT (genMain main)
+            $ newCodegen env wordSize
+          file = File (replaceExtension path)
+        putStrLn $ unpack $ ppllvm m
+        withContext $ \c ->
+          withModuleFromAST c m $ \cm ->
+            withHostTargetMachine $ \tm ->
+              writeObjectToFile tm file cm
   where
     notConcrete (TId _) = False
     notConcrete (TFunc a b) = notConcrete a || notConcrete b
     notConcrete _ = True
+    replaceExtension = reverse . r . reverse
+      where
+        r []       = []
+        r ('.':xs) = "o." ++ xs
+        r (x  :xs) = r xs
 
 genMain :: Typed Value -> BuilderState Operand
 genMain main = do
   wordSize <- gets getWordSize
-  function "main" [] (genTy retType) generator
+  function "main" [] i32 generator
   where
     generator _ = do
       block `named` "entry"
-      genVal mainArgs [] main `named` "ret" >>= ret
+      res <- genVal mainArgs [] main `named` "main.res"
+      printf (" => " ++ tyFmt retType) [res]
+      ret (lcint 32 0)
     (retType, mainArgs) =
       case typeof main of
         TFunc (TId "Unit") r -> (r, [unit])
@@ -172,6 +197,12 @@ genTy (TId "Nat") = i64
 genTy (TId "Bool") = i1
 genTy (TFunc _ _) = funcTy
 
+isRc :: Type -> Bool
+isRc (TId "Unit") = False
+isRc (TId "Nat") = False
+isRc (TId "Bool") = False
+isRc (TFunc _ _) = True
+
 unitTy :: LLVM.Type
 unitTy = LLVM.StructureType False []
 
@@ -188,13 +219,13 @@ destructorTy :: LLVM.Type
 destructorTy = LLVM.FunctionType void [ptr i8] False
 
 rcInc :: Int -> Operand -> Type -> Builder ()
-rcInc i o ty = puts ("inc " ++ unpack (ppll o) ++ " : " ++ show ty ++ " by " ++ show i)
+rcInc i o ty = return ()
 
 rcDec :: Int -> Operand -> Type -> Builder ()
-rcDec i o ty = puts ("dec " ++ unpack (ppll o) ++ " : " ++ show ty ++ " by " ++ show i)
+rcDec i o ty = return ()
 
 fnDec :: Builder ()
-fnDec = puts "should decrement saturated call here"
+fnDec = return ()
 
 genVal :: [Operand] -> Env (Typed Operand) -> Typed Value -> Builder Operand
 genVal [] _ (Unit ::: _) = return unit
@@ -206,8 +237,7 @@ genVal app env (Func xs expr ::: ty) = do
   if length (getParameters closureData) == length app then
     genStaticCall app closureData
   else do
-    closure <- genClosureForData env closureData
-    genApp ty app closure
+    genClosureForData env closureData >>= genApp ty app
 
 unit :: Operand
 unit = LLVM.ConstantOperand (C.Struct Nothing False [])
@@ -216,15 +246,17 @@ genIf :: Operand -> Builder Operand -> Builder Operand -> [(Typed Operand, Int)]
 genIf i t e diffs = mdo
   condBr i thenBlock elseBlock
   thenBlock <- block `named` "if.then"
-  sequence $ map thenDec diffs
+  sequence_ $ map thenDec diffs
   thenRes <- t `named` "if.then.res"
+  thenEndBlock <- currentBlock
   br endBlock
   elseBlock <- block `named` "if.else"
-  sequence $ map elseDec diffs
+  sequence_ $ map elseDec diffs
   elseRes <- e `named` "if.else.res"
+  elseEndBlock <- currentBlock
   br endBlock
   endBlock <- block `named` "if.end"
-  phi [(thenRes, thenBlock), (elseRes, elseBlock)]
+  phi [(thenRes, thenEndBlock), (elseRes, elseEndBlock)]
   where
     thenDec (o ::: ty, n)
       | n < 0     = rcDec n o ty
@@ -284,6 +316,7 @@ getStaticClosureData params expr = do
 
 buildStaticClosure :: [Typed Name] -> [Typed Name] -> Typed Expr -> BuilderState ClosureData
 buildStaticClosure free params expr = mdo
+  destructors <- buildDestructorList (map typeof params) (map typeof free) --TODO actually store this
   codegen <- get
   let
     combinedArgs = free ++ params
@@ -291,7 +324,7 @@ buildStaticClosure free params expr = mdo
       block `named` "entry"
       globals <- lift allValues
       let localScope = countLocals globals expr localEnv
-      sequence $ map localInc localScope
+      sequence_ $ map localInc localScope
       expr <- genExpr [] env expr `named` "ret"
       ret expr
       where
@@ -331,32 +364,33 @@ buildStaticClosure free params expr = mdo
   put (codegen { anonymousFunctions = result : anons })
   emitDefn (LLVM.GlobalDefinition def)
   func <- function funcName (map paramType combinedArgs) returnType body
+  wordSize <- gets getWordSize
   let
+    isize = LLVM.IntegerType wordSize
     fwdBody [dataPtr, lastParam] = do
       block `named` "entry"
-      (args, freePtr) <- iter dataPtr params
+      (args, freePtr) <- iter dataPtr [lastParam] $ tail $ reverse params
       loadedFrees <- if null free then
         return []
       else do
-        let structTy = LLVM.StructureType False $ map (genTy . typeof) free
+        let structTy = LLVM.StructureType False (isize : map (genTy . typeof) free)
         castPtr <- bitcast freePtr (ptr structTy) `named` "free.cast"
         let
           loadFree n = do
             varPtr <- gep castPtr [lcint 32 0, lcint 32 n] `named` "free.ptr"
             load varPtr 0 `named` "free"
-        sequence $ map loadFree [0 .. toInteger (length free - 1)]
+        sequence $ map loadFree [1 .. toInteger (length free)]
       res <- call func (map (\x -> (x, [])) (loadedFrees ++ args)) `named` "forward"
       ret res
       where
-        iter p (_:[]) = return ([lastParam], p)
-        iter p (x:xs) = do
-          cast <- bitcast p (ptr $ LLVM.StructureType False [genTy $ typeof x, ptr i8]) `named` "data.cast"
-          paramPtr <- gep cast [lcint 32 0, lcint 32 0] `named` "data.param.ptr"
+        iter p a []     = return (a, p)
+        iter p a (x:xs) = do
+          cast <- bitcast p (ptr $ LLVM.StructureType False [isize, genTy $ typeof x, ptr i8]) `named` "data.cast"
+          paramPtr <- gep cast [lcint 32 0, lcint 32 1] `named` "data.param.ptr"
           param <- load paramPtr 0 `named` "data.param"
-          nextPtr <- gep cast [lcint 32 0, lcint 32 1] `named` "data.next.ptr"
+          nextPtr <- gep cast [lcint 32 0, lcint 32 2] `named` "data.next.ptr"
           next <- load nextPtr 0 `named` "data.next"
-          (r, p) <- iter next xs
-          return (param:r, p)
+          iter next (param:a) xs
   fwd <- function fwdName [(ptr i8, "data.ptr"), (paramType $ last params)] returnType fwdBody
   let
     result = ClosureData
@@ -369,16 +403,110 @@ buildStaticClosure free params expr = mdo
         getFwd = fwd }
   return result
 
+buildDestructorList :: [Type] -> [Type] -> BuilderState [C.Constant]
+buildDestructorList [] [] = return []
+buildDestructorList [] frees = (: []) <$> buildDestructorNA frees
+buildDestructorList (args@(t:ts)) frees = do
+  rest <- buildDestructorList ts frees
+  (: rest) <$> buildDestructor args frees
+
+buildDestructorNA :: [Type] -> BuilderState C.Constant
+buildDestructorNA frees
+  | not $ any isRc frees = toConstant <$> genFree
+  | otherwise = do
+    destructors <- gets getDestructors
+    case Map.lookup label destructors of
+      Just destructor -> return destructor
+      Nothing -> genDestructor label functionName body
+  where
+    label = ([], frees)
+    functionName = "destructor;" ++ typeFmt frees
+    body [dataPtr] = do
+      block `named` "entry"
+      wordSize <- lift $ gets getWordSize
+      let isize = LLVM.IntegerType wordSize
+      castPtr <- bitcast dataPtr (ptr (LLVM.StructureType False (isize : map genTy frees)))
+      sequence_ $ zipWith (gen castPtr) frees [1..]
+      callFree dataPtr
+      retVoid
+    gen castPtr ty n
+      | isRc ty = do
+        ptr <- gep castPtr [lcint 32 0, lcint 32 n] `named` "ptr"
+        val <- load ptr 0 `named` "val"
+        rcDec (-1) val ty
+      | otherwise = return ()
+
+buildDestructor :: [Type] -> [Type] -> BuilderState C.Constant
+buildDestructor [] frees = buildDestructorNA frees
+buildDestructor (args@(t:ts)) frees
+  | null ts && null frees && not (isRc t) = toConstant <$> genFree
+  | otherwise = do
+    destructors <- gets getDestructors
+    case Map.lookup label destructors of
+      Just destructor -> return destructor
+      Nothing -> genDestructor label functionName body
+  where
+    label = (args, frees)
+    functionName = "destructor;" ++ typeFmt args ++ ';' : typeFmt frees
+    body [dataPtr] = do
+      block `named` "entry"
+      wordSize <- lift $ gets getWordSize
+      let isize = LLVM.IntegerType wordSize
+      castPtr <- bitcast dataPtr (ptr (LLVM.StructureType False [isize, genTy t, ptr isize])) `named` "cast.ptr"
+      if isRc t then do
+        ptr <- gep castPtr [lcint 32 0, lcint 32 1] `named` "ptr"
+        val <- load ptr 0 `named` "val"
+        rcDec (-1) val t
+      else return ()
+      if null ts && null frees
+        then do
+          callFree dataPtr
+          retVoid
+        else mdo
+          nextPtr <- gep castPtr [lcint 32 0, lcint 32 2] `named` "next.ptr"
+          next <- load nextPtr 0 `named` "next"
+          rc <- load next 0 `named` "rc"
+          newRc <- add rc (lcint wordSize (-1)) `named` "new.rc"
+          callFree dataPtr
+          continue <- icmp ICMP.EQ newRc (lcint 32 0) `named` "continue"
+          condBr continue yes no
+
+          yes <- block `named` "yes"
+          nextDestructor <- lift $ buildDestructor ts frees
+          cast <- bitcast next (ptr i8) `named` "next.cast"
+          call (LLVM.ConstantOperand nextDestructor) [(cast, [])]
+          retVoid
+
+          no <- block `named` "no"
+          store next 0 newRc
+          retVoid
+
+typeFmt :: [Type] -> String
+typeFmt types = intercalate "," $ map show types
+
+toConstant :: Operand -> C.Constant
+toConstant (LLVM.ConstantOperand c) = c
+
+genDestructor :: DestructorEntry -> String -> ([Operand] -> Builder ()) -> BuilderState C.Constant
+genDestructor label name body = do
+  c <- toConstant <$> function (fromString name) [(ptr i8, "data.ptr")] void body
+  modify (\s -> s { getDestructors = Map.insert label c (getDestructors s) })
+  return c
+
 genClosureForData :: Env (Typed Operand) -> ClosureData -> Builder Operand
 genClosureForData env closureData = do
+  wordSize <- lift (gets getWordSize)
   let
+    isize = LLVM.IntegerType wordSize
     params = getParameters closureData
     frees = getFreeVars closureData
-    storedType = map (genTy . typeof) frees
+    storedType = isize : map (genTy . typeof) frees
   dataPtr <- if null frees then
       return $ LLVM.ConstantOperand $ C.Null $ ptr i8
     else do
       (dataPtr, dataPtrI8) <- malloc $ LLVM.StructureType False storedType
+      addr <- gep dataPtr [lcint 32 0, lcint 32 0] `named` "rc.ptr"
+      store addr 0 (lcint wordSize 1)
       let
         freeMap (name ::: _) n =
           case lookup name env of
@@ -386,7 +514,7 @@ genClosureForData env closureData = do
             Just (res ::: _) -> do
               addr <- gep dataPtr [lcint 32 0, lcint 32 n] `named` "capture"
               store addr 0 res
-      sequence $ zipWith freeMap frees [0..]
+      sequence_ $ zipWith freeMap frees [1..]
       return dataPtrI8
   genStruct [getInfo closureData, lcint 32 $ toInteger $ length params - 1, dataPtr]
 
@@ -404,6 +532,8 @@ genCallClosureNF retType closure arg = do
 
 genCallClosure :: Operand -> Operand -> Builder Operand
 genCallClosure closure arg = mdo
+  wordSize <- lift $ gets getWordSize
+  let isize = LLVM.IntegerType wordSize
   arity <- extractValue closure [1] `named` "arity"
   dataPtr <- extractValue closure [2] `named` "data.ptr"
   isSaturated <- icmp ICMP.EQ arity (lcint 32 0) `named` "saturated"
@@ -417,23 +547,27 @@ genCallClosure closure arg = mdo
   castFunc <- bitcast func (ptr castTy) `named` "func.cast"
   thenRes <- call castFunc [(dataPtr, []), (arg, [])] `named` "res.sat"
   fnDec -- TODO function dec
+  thenEndBlock <- currentBlock
   br endBlock
 
   -- For unsaturated calls, the rc doesn't need to be decremented because
   -- the existing closure reference is stored in the new data pointer
   elseBlock <- block `named` "call.unsaturated"
-  (newDataPtr, newDataPtrI8) <- malloc $ LLVM.StructureType False [LLVM.typeOf arg, ptr i8]
-  argPtr <- gep newDataPtr [lcint 32 0, lcint 32 0] `named` "data.arg"
+  (newDataPtr, newDataPtrI8) <- malloc $ LLVM.StructureType False [isize, LLVM.typeOf arg, ptr i8]
+  rcPtr <- gep newDataPtr [lcint 32 0, lcint 32 0] `named` "data.rc"
+  store rcPtr 0 (lcint wordSize 1)
+  argPtr <- gep newDataPtr [lcint 32 0, lcint 32 1] `named` "data.arg"
   store argPtr 0 arg
-  nextPtr <- gep newDataPtr [lcint 32 0, lcint 32 1] `named` "data.next"
+  nextPtr <- gep newDataPtr [lcint 32 0, lcint 32 2] `named` "data.next"
   store nextPtr 0 dataPtr
-  newArity <- sub arity (lcint 32 1) `named` "arity.new"
+  newArity <- add arity (lcint 32 (-1)) `named` "arity.new"
   closureUpdated <- insertValue closure newArity [1] `named` "insert"
   elseRes <- insertValue closureUpdated newDataPtrI8 [2] `named` "res.unsat"
+  elseEndBlock <- currentBlock
   br endBlock
 
   endBlock <- block `named` "call.end"
-  phi [(thenRes, thenBlock), (elseRes, elseBlock)]
+  phi [(thenRes, thenEndBlock), (elseRes, elseEndBlock)]
 
 lcint :: Word32 -> Integer -> Operand
 lcint n m = LLVM.ConstantOperand $ C.Int n m
@@ -464,21 +598,88 @@ malloc ty = do
   cast <- bitcast res (ptr ty) `named` "malloc.ptr"
   return (cast, res)
 
+genFree :: BuilderState Operand
+genFree = do
+  s <- get
+  case getFree s of
+    Nothing -> do
+      free <- extern "free" [ptr i8] void
+      put $ s { getFree = Just free }
+      return free
+    Just free -> return free
+
+callFree :: Operand -> Builder ()
+callFree arg = do
+  free <- lift genFree
+  cast <- bitcast arg (ptr i8) `named` "free.ptr"
+  call free [(cast, [])]
+  return ()
+
 puts :: String -> Builder ()
 puts string = do
   s <- lift get
+  let count = getStringCount s
   (count, puts) <- case getPuts s of
     Nothing -> do
-      puts <- lift $ extern "puts" [ptr i8] void
-      lift $ put $ s { getStringCount = 1, getPuts = Just puts }
-      return (0, puts)
+      puts <- lift $ extern "puts" [ptr i8] i32
+      lift $ put $ s { getStringCount = count+1, getPuts = Just puts }
+      return (count, puts)
     Just puts -> do
-      let count = getStringCount s
       lift $ put $ s { getStringCount = count+1 }
       return (count, puts)
   str <- emitString count string
-  call puts [(str, [])]
+  call puts [(str, [])] `named` (fromString ("_" ++ show count))
   return ()
+
+tyFmt :: Type -> String
+tyFmt (TId "Unit") = "unit"
+tyFmt (TId "Bool") = "bool(%d)"
+tyFmt (TId "Nat") = "nat(%llu)"
+tyFmt (TFunc _ _) = fnFmt
+
+fnFmt :: String
+fnFmt = "func(%p, %d, %p)"
+
+printf :: String -> [Operand] -> Builder ()
+printf fmt args = do
+  s <- lift get
+  let wordSize = getWordSize s
+  let count = getStringCount s
+  (count, printf) <- case getPrintf s of
+    Nothing -> do
+      lift $ emitDefn $ LLVM.GlobalDefinition $ printfGlobal
+      let printf = LLVM.ConstantOperand (C.GlobalReference printfType "printf")
+      lift $ put $ s { getStringCount = count+1, getPrintf = Just printf }
+      return (count, printf)
+    Just printf -> do
+      lift $ put $ s { getStringCount = count+1 }
+      return (count, printf)
+  str <- emitString count (fmt ++ "\n")
+  call printf ((str, []) : map (\x -> (x, [])) args) `named` (fromString ("_" ++ show count))
+  return ()
+  where
+    printfGlobal = LLVM.Function
+      L.External
+      V.Default
+      Nothing
+      CC.C
+      []
+      i32
+      "printf"
+      ([LLVM.Parameter (ptr i8) "fmt" []], True)
+      []
+      Nothing
+      Nothing
+      0
+      Nothing
+      Nothing
+      []
+      Nothing
+      []
+    printfType = ptr $ LLVM.FunctionType
+      i32
+      [ptr i8]
+      True
 
 emitString :: Int -> String -> Builder Operand
 emitString count string = do

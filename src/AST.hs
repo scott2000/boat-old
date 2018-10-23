@@ -40,7 +40,7 @@ data Type
   | TId String
   | TVar String
   | TFunc Type Type
-  deriving Eq
+  deriving (Eq, Ord)
 
 data Typed a = (:::)
   { valof :: a,

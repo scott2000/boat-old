@@ -232,9 +232,9 @@ generic_name = helper 26 1
     builder a s c =
       builder ((letters !! (rem c 26)) : a) (s-1) (div c 26)
 
-unique_name :: Set.Set String -> Int -> (Int, String)
-unique_name deny n
-  | Set.member name deny = unique_name deny (n+1)
+uniqueName :: Set.Set String -> Int -> (Int, String)
+uniqueName deny n
+  | Set.member name deny = uniqueName deny (n+1)
   | otherwise = (n+1, name)
   where
     name = generic_name n
@@ -245,7 +245,7 @@ quantify deny (TAnon a) = do
   case Map.lookup a m of
     Just x -> return ()
     Nothing -> do
-      let (n', name) = unique_name deny n
+      let (n', name) = uniqueName deny n
       let var = TVar name
       put (Map.insert a var m, n')
 quantify deny (TFunc a b) = quantify deny a >> quantify deny b
@@ -310,7 +310,7 @@ instance TypeMap Value where
   mapTypes _ other = other
 
   verifyTypes (Func xs expr) = do
-    sequence $ map verifyTypes xs
+    sequence_ $ map verifyTypes xs
     verifyTypes expr
   verifyTypes _ = Right ()
 
