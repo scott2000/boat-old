@@ -1,5 +1,6 @@
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Compile (compile) where
 
@@ -36,12 +37,34 @@ import Data.Text.Lazy (unpack)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
+{-
+
+Current Goals:
+
+- implement reference counting completely
+- move dynamic function applications into separate llvm functions
+    (`app.ARG` for function results, `app.ARG.RES` for other results)
+- add `rec` keyword for tail recursion
+- add generalized tuples and tuple extensions
+
+Possible Future Optimizations:
+
+- let substitution for single use values
+    (this could change evaluation order)
+- statically optimized currying
+    (not using application)
+- replacement of recursion for top-level values with `rec` keyword where applicable
+    (possibly emit warning?)
+- tuple expansion into arguments, substitute `void` for `unit`
+
+-}
+
 type DestructorEntry = ([Type], [Type]) -- args, frees
 
 data Codegen = Codegen
   { anonymousFunctions :: [ClosureData],
     values :: Env (Typed Value),
-    getWordSize :: Word32,
+    getWordSize :: !Word32,
     getDestructors :: Map.Map DestructorEntry C.Constant,
     getMalloc :: Maybe Operand,
     getFree :: Maybe Operand,
@@ -55,7 +78,6 @@ data ClosureData = ClosureData
     getFreeVars :: [Typed Name],
     getParameters :: [Typed Name],
     getInnerExpr :: Typed Expr,
-    getInfo :: Operand,
     getFunc :: Operand,
     getFwd :: Operand }
   deriving Show
@@ -120,7 +142,11 @@ compile path env wordSize =
 genMain :: Typed Value -> BuilderState Operand
 genMain main = do
   wordSize <- gets getWordSize
-  function "main" [] i32 generator
+  llvmFn $ newFn
+    { fnName = "main",
+      fnRetTy = i32,
+      fnParams = [],
+      fnBody = Just generator }
   where
     generator _ = do
       block `named` "entry"
@@ -157,6 +183,11 @@ genExpr app env (expr ::: ty) =
       rcDec (-1) b bTy
       r <- genOp op a b
       genApp ty app r
+    If (Val (Bool b) ::: _) t e ->
+      if b then
+        genExpr app env t
+      else
+        genExpr app env e
     If i t e -> do
       globals <- lift allValues
       let thenScope = countLocals globals t localEnv
@@ -207,10 +238,7 @@ unitTy :: LLVM.Type
 unitTy = LLVM.StructureType False []
 
 funcTy :: LLVM.Type
-funcTy = LLVM.StructureType False [ptr infoTy, i32, ptr i8]
-
-infoTy :: LLVM.Type
-infoTy = LLVM.StructureType False [ptr voidFuncTy, ptr destructorTy]
+funcTy = LLVM.StructureType False [ptr voidFuncTy, i32, ptr i8]
 
 voidFuncTy :: LLVM.Type
 voidFuncTy = LLVM.FunctionType void [] False
@@ -219,13 +247,18 @@ destructorTy :: LLVM.Type
 destructorTy = LLVM.FunctionType void [ptr i8] False
 
 rcInc :: Int -> Operand -> Type -> Builder ()
+rcInc i o (TFunc _ _) = fnInc i o
 rcInc i o ty = return ()
 
 rcDec :: Int -> Operand -> Type -> Builder ()
+rcDec i o (TFunc _ _) = fnDec i o
 rcDec i o ty = return ()
 
-fnDec :: Builder ()
-fnDec = return ()
+fnInc :: Int -> Operand -> Builder ()
+fnInc i closure = return ()
+
+fnDec :: Int -> Operand -> Builder ()
+fnDec i closure = return ()
 
 genVal :: [Operand] -> Env (Typed Operand) -> Typed Value -> Builder Operand
 genVal [] _ (Unit ::: _) = return unit
@@ -316,7 +349,7 @@ getStaticClosureData params expr = do
 
 buildStaticClosure :: [Typed Name] -> [Typed Name] -> Typed Expr -> BuilderState ClosureData
 buildStaticClosure free params expr = mdo
-  destructors <- buildDestructorList (map typeof params) (map typeof free) --TODO actually store this
+  destructors <- buildDestructorList (init $ map typeof params) (map typeof free)
   codegen <- get
   let
     combinedArgs = free ++ params
@@ -338,32 +371,16 @@ buildStaticClosure free params expr = mdo
     anons = anonymousFunctions codegen
     currentValue = getFunctionName codegen
     len = length anons
-    infoName = fromString ("info." ++ currentValue ++ "." ++ show len)
-    fwdType = LLVM.FunctionType returnType [ptr i8, genTy $ typeof $ last params] False
-    def = LLVM.GlobalVariable
-      infoName
-      L.External
-      V.Default
-      Nothing
-      Nothing
-      Nothing
-      True
-      infoTy
-      (AddrSpace 0)
-      (Just (C.Struct Nothing False
-        [ C.BitCast (C.GlobalReference (ptr fwdType) fwdName) (ptr voidFuncTy),
-          C.Null (ptr destructorTy) ]))
-      Nothing
-      Nothing
-      0
-      []
     paramType (Name name ::: ty) = (genTy ty, fromString name)
-    funcName = fromString ("func." ++ currentValue ++ "." ++ show len)
-    fwdName = fromString ("fwd." ++ currentValue ++ "." ++ show len)
     returnType = genTy $ typeof expr
   put (codegen { anonymousFunctions = result : anons })
-  emitDefn (LLVM.GlobalDefinition def)
-  func <- function funcName (map paramType combinedArgs) returnType body
+  func <-
+    llvmFn $ newFn
+      { fnLinkage = L.Private,
+        fnName = "func." ++ currentValue ++ "." ++ show len,
+        fnRetTy = returnType,
+        fnParams = map paramType combinedArgs,
+        fnBody = Just body }
   wordSize <- gets getWordSize
   let
     isize = LLVM.IntegerType wordSize
@@ -391,14 +408,25 @@ buildStaticClosure free params expr = mdo
           nextPtr <- gep cast [lcint 32 0, lcint 32 2] `named` "data.next.ptr"
           next <- load nextPtr 0 `named` "data.next"
           iter next (param:a) xs
-  fwd <- function fwdName [(ptr i8, "data.ptr"), (paramType $ last params)] returnType fwdBody
+  fwd <-
+    llvmFn $ newFn
+      { fnLinkage = L.Private,
+        fnName = "fwd." ++ currentValue ++ "." ++ show len,
+        fnPrefix =
+          if null destructors then
+            Nothing
+          else Just $ C.Array
+            (ptr $ LLVM.FunctionType void [ptr i8] False)
+            (reverse destructors),
+        fnRetTy = returnType,
+        fnParams = [(ptr i8, "data.ptr"), paramType $ last params],
+        fnBody = Just fwdBody }
   let
     result = ClosureData
       { getClosureIndex = len,
         getFreeVars = free,
         getParameters = params,
         getInnerExpr = expr,
-        getInfo = LLVM.ConstantOperand (C.GlobalReference (ptr infoTy) infoName),
         getFunc = func,
         getFwd = fwd }
   return result
@@ -489,7 +517,13 @@ toConstant (LLVM.ConstantOperand c) = c
 
 genDestructor :: DestructorEntry -> String -> ([Operand] -> Builder ()) -> BuilderState C.Constant
 genDestructor label name body = do
-  c <- toConstant <$> function (fromString name) [(ptr i8, "data.ptr")] void body
+  destructor <-
+    llvmFn $ newFn
+      { fnName = name,
+        fnRetTy = void,
+        fnParams = [(ptr i8, "data.ptr")],
+        fnBody = Just body }
+  let c = toConstant destructor
   modify (\s -> s { getDestructors = Map.insert label c (getDestructors s) })
   return c
 
@@ -516,18 +550,16 @@ genClosureForData env closureData = do
               store addr 0 res
       sequence_ $ zipWith freeMap frees [1..]
       return dataPtrI8
-  genStruct [getInfo closureData, lcint 32 $ toInteger $ length params - 1, dataPtr]
+  genStruct [getFwd closureData, lcint 32 $ toInteger $ negate $ length params, dataPtr]
 
 genCallClosureNF :: LLVM.Type -> Operand -> Operand -> Builder Operand
 genCallClosureNF retType closure arg = do
+  funcPtr <- extractValue closure [0] `named` "func.ptr"
   dataPtr <- extractValue closure [2] `named` "data.ptr"
-  infoPtr <- extractValue closure [0] `named` "info.ptr"
-  funcPtr <- gep infoPtr [lcint 32 0, lcint 32 0] `named` "func.ptr"
-  func <- load funcPtr 0 `named` "func"
   let funcTy = LLVM.FunctionType retType [ptr i8, LLVM.typeOf arg] False
-  castFunc <- bitcast func (ptr funcTy) `named` "func.cast"
+  castFunc <- bitcast funcPtr (ptr funcTy) `named` "func.cast"
   res <- call castFunc [(dataPtr, []), (arg, [])]
-  fnDec -- TODO function dec
+  fnDec (-1) closure
   return res
 
 genCallClosure :: Operand -> Operand -> Builder Operand
@@ -536,17 +568,15 @@ genCallClosure closure arg = mdo
   let isize = LLVM.IntegerType wordSize
   arity <- extractValue closure [1] `named` "arity"
   dataPtr <- extractValue closure [2] `named` "data.ptr"
-  isSaturated <- icmp ICMP.EQ arity (lcint 32 0) `named` "saturated"
+  isSaturated <- icmp ICMP.EQ arity (lcint 32 (-1)) `named` "saturated"
   condBr isSaturated thenBlock elseBlock
 
   thenBlock <- block `named` "call.saturated"
-  infoPtr <- extractValue closure [0] `named` "info.ptr"
-  funcPtr <- gep infoPtr [lcint 32 0, lcint 32 0] `named` "func.ptr"
-  func <- load funcPtr 0 `named` "func"
+  funcPtr <- extractValue closure [0] `named` "func.ptr"
   let castTy = LLVM.FunctionType funcTy [ptr i8, LLVM.typeOf arg] False
-  castFunc <- bitcast func (ptr castTy) `named` "func.cast"
+  castFunc <- bitcast funcPtr (ptr castTy) `named` "func.cast"
   thenRes <- call castFunc [(dataPtr, []), (arg, [])] `named` "res.sat"
-  fnDec -- TODO function dec
+  fnDec (-1) closure
   thenEndBlock <- currentBlock
   br endBlock
 
@@ -589,7 +619,11 @@ malloc ty = do
   let wordSize = getWordSize s
   malloc <- case getMalloc s of
     Nothing -> do
-      malloc <- lift $ extern "malloc" [LLVM.IntegerType wordSize] (ptr i8)
+      malloc <-
+        lift $ llvmFn $ newFn
+          { fnName = "malloc",
+            fnRetTy = ptr i8,
+            fnParams = [(LLVM.IntegerType wordSize, NoParameterName)] }
       lift $ put $ s { getMalloc = Just malloc }
       return malloc
     Just malloc -> return malloc
@@ -603,7 +637,11 @@ genFree = do
   s <- get
   case getFree s of
     Nothing -> do
-      free <- extern "free" [ptr i8] void
+      free <-
+        llvmFn $ newFn
+          { fnName = "free",
+            fnRetTy = void,
+            fnParams = [(ptr i8, NoParameterName)] }
       put $ s { getFree = Just free }
       return free
     Just free -> return free
@@ -621,7 +659,11 @@ puts string = do
   let count = getStringCount s
   (count, puts) <- case getPuts s of
     Nothing -> do
-      puts <- lift $ extern "puts" [ptr i8] i32
+      puts <-
+        lift $ llvmFn $ newFn
+          { fnName = "puts",
+            fnRetTy = i32,
+            fnParams = [(ptr i8, NoParameterName)] }
       lift $ put $ s { getStringCount = count+1, getPuts = Just puts }
       return (count, puts)
     Just puts -> do
@@ -647,8 +689,12 @@ printf fmt args = do
   let count = getStringCount s
   (count, printf) <- case getPrintf s of
     Nothing -> do
-      lift $ emitDefn $ LLVM.GlobalDefinition $ printfGlobal
-      let printf = LLVM.ConstantOperand (C.GlobalReference printfType "printf")
+      printf <-
+        lift $ llvmFn $ newFn
+          { fnVarargs = True,
+            fnRetTy = i32,
+            fnParams = [(ptr i8, "fmt")],
+            fnName = "printf" }
       lift $ put $ s { getStringCount = count+1, getPrintf = Just printf }
       return (count, printf)
     Just printf -> do
@@ -657,51 +703,108 @@ printf fmt args = do
   str <- emitString count (fmt ++ "\n")
   call printf ((str, []) : map (\x -> (x, [])) args) `named` (fromString ("_" ++ show count))
   return ()
-  where
-    printfGlobal = LLVM.Function
-      L.External
-      V.Default
-      Nothing
-      CC.C
-      []
-      i32
-      "printf"
-      ([LLVM.Parameter (ptr i8) "fmt" []], True)
-      []
-      Nothing
-      Nothing
-      0
-      Nothing
-      Nothing
-      []
-      Nothing
-      []
-    printfType = ptr $ LLVM.FunctionType
-      i32
-      [ptr i8]
-      True
 
 emitString :: Int -> String -> Builder Operand
-emitString count string = do
-  lift $ emitDefn (LLVM.GlobalDefinition global)
-  return (LLVM.ConstantOperand (C.BitCast (C.GlobalReference (ptr ty) name) (ptr i8)))
+emitString count string =
+  lift $ llvmGlobal $ newGlobal
+    { globalLinkage = L.Private,
+      globalName = "str." ++ show count,
+      globalConstant = True,
+      globalType = LLVM.ArrayType (fromIntegral (length asciiString)) i8,
+      globalInitializer = Just (C.Array i8 asciiString) }
   where
     asciiString = map charToByte (string ++ "\0")
     charToByte ch = C.Int 8 (toInteger (fromEnum ch))
-    global = LLVM.GlobalVariable
-      name
-      L.Private
-      V.Default
-      Nothing
-      Nothing
-      Nothing
-      True
-      ty
-      (AddrSpace 0)
-      (Just (C.Array i8 asciiString))
-      Nothing
-      Nothing
-      0
-      []
-    name = fromString ("str." ++ show count)
-    ty = LLVM.ArrayType (fromIntegral (length asciiString)) i8
+
+llvmGlobal :: GlobalHelper -> BuilderState Operand
+llvmGlobal GlobalHelper {..} = do
+  let llname = fromString globalName
+  emitDefn $ LLVM.GlobalDefinition (LLVM.GlobalVariable
+    llname
+    globalLinkage
+    globalVisibility
+    Nothing
+    Nothing
+    Nothing
+    globalConstant
+    globalType
+    (AddrSpace 0)
+    globalInitializer
+    Nothing
+    Nothing
+    0
+    [])
+  return $ LLVM.ConstantOperand $ C.GlobalReference (ptr globalType) llname
+
+data GlobalHelper = GlobalHelper
+  { globalName :: String,
+    globalLinkage :: L.Linkage,
+    globalVisibility :: V.Visibility,
+    globalConstant :: Bool,
+    globalType :: LLVM.Type,
+    globalInitializer :: Maybe C.Constant }
+
+newGlobal :: GlobalHelper
+newGlobal = GlobalHelper
+  { globalName = error "missing global name",
+    globalLinkage = L.External,
+    globalVisibility = V.Default,
+    globalConstant = error "missing global constant",
+    globalType = error "missing global type",
+    globalInitializer = Nothing }
+
+llvmFn :: FunctionHelper -> BuilderState Operand
+llvmFn FunctionHelper {..} = do
+  (params, blocks) <- runIRBuilderT emptyIRBuilder $ do
+    params <- sequence $ flip map fnParams $ \(t, x) -> case x of
+      NoParameterName -> (,) t <$> fresh
+      ParameterName p -> (,) t <$> fresh `named` p
+    case fnBody of
+      Nothing -> return ()
+      Just body ->
+        body $ map (uncurry LLVM.LocalReference) params
+    return params
+  let llname = fromString fnName
+  let ty = ptr (LLVM.FunctionType fnRetTy (map fst params) fnVarargs)
+  emitDefn $ LLVM.GlobalDefinition (LLVM.Function
+    fnLinkage
+    fnVisibility
+    Nothing
+    fnCC
+    []
+    fnRetTy
+    llname
+    (map (\(t, n) -> LLVM.Parameter t n []) params, fnVarargs)
+    []
+    Nothing
+    Nothing
+    0
+    Nothing
+    fnPrefix
+    blocks
+    Nothing
+    [])
+  return $ LLVM.ConstantOperand $ C.GlobalReference ty llname
+
+data FunctionHelper = FunctionHelper
+  { fnName :: String,
+    fnLinkage :: L.Linkage,
+    fnVisibility :: V.Visibility,
+    fnCC :: CC.CallingConvention,
+    fnPrefix :: Maybe C.Constant,
+    fnRetTy :: LLVM.Type,
+    fnParams :: [(LLVM.Type, ParameterName)],
+    fnVarargs :: Bool,
+    fnBody :: Maybe ([Operand] -> Builder ()) }
+
+newFn :: FunctionHelper
+newFn = FunctionHelper
+  { fnName = error "missing function name",
+    fnLinkage = L.External,
+    fnVisibility = V.Default,
+    fnCC = CC.C,
+    fnPrefix = Nothing,
+    fnRetTy = error "missing return type",
+    fnParams = error "missing parameter types",
+    fnVarargs = False,
+    fnBody = Nothing }
