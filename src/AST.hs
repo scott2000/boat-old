@@ -103,6 +103,12 @@ declToList = map (\(Decl n e) -> (n, e))
 deps :: Bool -> [Name] -> Typed Expr -> State (Set.Set Name) ()
 deps lam env (expr ::: ty) =
   case expr of
+    Val (Func params expr) ->
+      if lam then
+        deps lam (map valof params ++ env) expr
+      else
+        return ()
+    Val _ -> return ()
     Id name ->
       if name `elem` env then
         return ()
@@ -112,45 +118,45 @@ deps lam env (expr ::: ty) =
     App a b -> deps lam env a >> deps lam env b
     If i t e -> deps lam env i >> deps lam env t >> deps lam env e
     Let name val expr -> deps lam env val >> deps lam (valof name : env) expr
-    Val (Func params expr) ->
-      if lam then
-        deps lam (map valof params ++ env) expr
-      else
-        return ()
-    _ -> return ()
 
-countLocals :: [Name] -> Typed Expr -> Env Int -> Env Int
-countLocals globals (expr ::: _) env =
+countLocals :: Typed Expr -> Env Int -> Env Int
+countLocals (expr ::: _) env =
   case expr of
     Val (Func xs expr) ->
       let
-        params = map (\(x ::: _) -> (x, 0)) xs
-        env' = params ++ env
+        remove (x, _) = (x, 0)
+        emptyEnv = map remove env
+        toEnv (x ::: _) = (x, 0)
+        env' = map toEnv xs ++ emptyEnv
+        fix (x, 0) = (x, 0)
+        fix (x, _) = (x, 1)
       in
-        drop (length xs) (countLocals globals expr env')
-    Id name
-      | name `elem` globals -> env
-      | otherwise -> addName name env
+        zipEnv (+) env $ map fix $ drop (length xs) $ countLocals expr env'
+    Val _ -> env
+    Id name ->
+      addName name env
     Op _ a b ->
-      countLocals globals b (countLocals globals a env)
+      countLocals b $ countLocals a env
     App a b ->
-      countLocals globals b (countLocals globals a env)
+      countLocals b $ countLocals a env
     If i t e ->
       let
-        env' = countLocals globals i env
-        te = countLocals globals t env'
-        ee = countLocals globals e env'
+        env' = countLocals i env
+        te = countLocals t env'
+        ee = countLocals e env'
       in
         zipEnv max te ee
     Let (name ::: _) val expr ->
-      tail $ countLocals globals expr ((name, 0) : countLocals globals val env)
-    _ -> env
+      let
+        valLocals = countLocals val env
+        env' = (name, 0) : valLocals
+      in
+        tail $ countLocals expr env'
   where
-    addName name ((e@(n, x)):xs) =
-      if n == name then
-        (n, x+1):xs
-      else
-        e : addName name xs
+    addName name [] = []
+    addName name ((e@(n, x)) : xs)
+      | n == name = (n, x+1) : xs
+      | otherwise = e : addName name xs
 
 substitute :: Name -> Value -> Typed Expr -> Typed Expr
 substitute name value (expr ::: ty) =
