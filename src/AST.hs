@@ -3,12 +3,12 @@ module AST
     Type (..),
     Typed (..),
     Value (..),
-    Decl (..),
+    Decls (..),
     Name (..),
     Env,
     OpEntry,
-    declFromList,
-    declToList,
+    emptyDecls,
+    showValDecl,
     deps,
     countLocals,
     substitute,
@@ -16,6 +16,7 @@ module AST
     zipEnv,
     getOp,
     mkFuncTy,
+    tIdVar,
     tUnit,
     tNat,
     tBool )
@@ -54,8 +55,8 @@ data Value
   | Func [Typed Name] (Typed Expr)
   deriving Eq
 
-data Decl
-  = Decl Name (Typed Expr)
+data Decls = Decls
+  { valDecls :: Env (Typed Expr) }
   deriving Eq
 
 newtype Name
@@ -88,17 +89,16 @@ instance Show Value where
   show (Bool False) = "false"
   show (Func xs expr) = "(\\" ++ unwords (map show xs) ++ " -> " ++ show expr ++ ")"
 
-instance Show Decl where
-  show (Decl name (val ::: ty)) = "val " ++ show name ++ " : " ++ show ty ++ " = " ++ show val
-
 instance Show Name where
   show (Name s) = s
 
-declFromList :: Env (Typed Expr) -> [Decl]
-declFromList = map (uncurry Decl)
+emptyDecls :: Decls
+emptyDecls = Decls
+  { valDecls = [] }
 
-declToList :: [Decl] -> Env (Typed Expr)
-declToList = map (\(Decl n e) -> (n, e))
+showValDecl :: (Name, Typed Expr) -> String
+showValDecl (name, val ::: ty) =
+  "val " ++ show name ++ " : " ++ show ty ++ " = " ++ show val
 
 deps :: Bool -> [Name] -> Typed Expr -> State (Set.Set Name) ()
 deps lam env (expr ::: ty) =
@@ -230,9 +230,9 @@ mkFuncTy :: [Type] -> Type -> Type
 mkFuncTy [] r = r
 mkFuncTy (x:xs) r = TFunc x (mkFuncTy xs r)
 
-tyString :: String -> Type
-tyString [] = error "type name cannot be empty"
-tyString s =
+tIdVar :: String -> Type
+tIdVar [] = error "type name cannot be empty"
+tIdVar s =
   if head s `elem` ['A'..'Z'] then
     TId s
   else

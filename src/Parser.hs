@@ -1,4 +1,6 @@
-module Parser ( MParser, Parser, declParser, exprParser, symbol, sc, sc' ) where
+{-# LANGUAGE FlexibleInstances #-}
+
+module Parser ( MParser, Parser, Parsable (..), valDeclParser, parser, symbol, sc, sc' ) where
 
 import AST
 
@@ -13,71 +15,94 @@ import qualified Text.Megaparsec.Char.Lexer as L
 type MParser = Parsec Void String
 type Parser = StateT Word64 MParser
 
-declParser :: Parser Decl
-declParser = do
-  symbol $ try $ key "val"
+class Parsable a where
+  parsePartial :: Parser a
+  parsedOp :: String -> a -> a -> Parser a
+  parsedApp :: a -> a -> Parser a
+
+valDeclParser :: Parser (Name, Typed Expr)
+valDeclParser = do
+  try $ symbol $ key "val"
   name <- name
+  ty <- parseAscription
   symbol $ string "="
-  expr <- exprParser
-  return (Decl name expr)
+  expr <- parser
+  return (name, ascribe expr ty)
 
-exprParser :: Parser (Typed Expr)
-exprParser = symbol $ (exprParserPrec minPrec <?> "expression")
+parser :: Parsable a => Parser a
+parser = symbol $ (parserPrec minPrec)
 
-exprParserPartial :: Parser (Typed Expr)
-exprParserPartial = try paren
-  <|> try (typed function)
-  <|> try (typed letbinding)
-  <|> try (typed ifThenElse)
-  <|> try (typed (Id <$> name))
-  <|> try (symbol $ key "unit" >> return (Val Unit ::: tUnit))
-  <|> try (symbol $ key "true" >> return (Val (Bool True) ::: tBool))
-  <|> try (symbol $ key "false" >> return (Val (Bool False) ::: tBool))
-  <|> (::: tNat) <$> Val <$> Nat <$> number
+instance Parsable (Typed Expr) where
+  parsePartial = maybeRetype $ try paren
+    <|> try (typed function)
+    <|> try (typed letbinding)
+    <|> try (typed ifThenElse)
+    <|> try (typed (Id <$> name))
+    <|> try (symbol $ key "unit" >> return (Val Unit ::: tUnit))
+    <|> try (symbol $ key "true" >> return (Val (Bool True) ::: tBool))
+    <|> try (symbol $ key "false" >> return (Val (Bool False) ::: tBool))
+    <|> (::: tNat) <$> Val <$> Nat <$> number
 
-exprParserPrec :: (Prec, Assoc) -> Parser (Typed Expr)
-exprParserPrec = exprParserBase exprParserPartial
+  parsedOp "->" _ _ = error ("cannot use (->) operator in expression")
+  parsedOp op a b = typed $ return $ Op op a b
 
-exprParserBase :: Parser (Typed Expr) -> (Prec, Assoc) -> Parser (Typed Expr)
-exprParserBase base prec = do
-  expr <- base
-  try (opExpr expr) <|> try (appExpr expr) <|> return expr
+  parsedApp a b = typed $ return $ App a b
+
+instance Parsable Type where
+  parsePartial = try paren
+    <|> try (tIdVar <$> identifier)
+    <|> (symbol $ key "_" >> newType)
+
+  parsedOp "->" a b = return $ TFunc a b
+  parsedOp op _ _ = error ("cannot use (" ++ op ++ ") operator in type")
+
+  parsedApp a b = error ("cannot use application in type")
+
+parserPrec :: Parsable a => (Prec, Assoc) -> Parser a
+parserPrec = parserBase parsePartial
   where
-    opExpr expr = do
-      (op, kind) <- operatorInContext
-      if isInfix kind then
-        let newPrec = adjustPrec kind $ precedence op in
-        case precError prec newPrec of
+  parserBase base prec = do
+    expr <- base
+    try (opExpr expr) <|> try (appExpr expr) <|> return expr
+    where
+      opExpr expr = do
+        (op, kind) <- operatorInContext
+        if isInfix kind then
+          let newPrec = adjustPrec kind $ precedence op in
+          case precError prec newPrec of
+            Just err -> fail err
+            Nothing -> do
+              other <- parserPrec newPrec
+              parserBase (parsedOp op expr other) prec
+        else
+          error ("cannot use operator of kind " ++ show kind ++ " here")
+      appExpr expr =
+        case precError prec appPrec of
           Just err -> fail err
           Nothing -> do
-            other <- exprParserPrec newPrec
-            exprParserBase (typed (return (Op op expr other))) prec
-      else
-        error ("cannot use operator of kind " ++ show kind ++ " here")
-    appExpr expr =
-      case precError prec appPrec of
-        Just err -> fail err
-        Nothing -> do
-          other <- exprParserPrec appPrec
-          exprParserBase (typed (return (App expr other))) prec
+            other <- parserPrec appPrec
+            parserBase (parsedApp expr other) prec
 
 symbol :: Parser a -> Parser a
 symbol p = sc' >> p
 
+comment :: Parser ()
+comment = hidden $ skipMany $ choice [lineCmnt, blockCmnt]
+
 sc :: Parser ()
-sc = hidden (skipSome $ choice [space1, lineCmnt, blockCmnt])
+sc = hidden $ skipSome $ choice [space1, lineCmnt, blockCmnt]
 
 sc' :: Parser ()
-sc' = hidden (skipMany $ choice [space1, lineCmnt, blockCmnt])
+sc' = hidden $ skipMany $ choice [space1, lineCmnt, blockCmnt]
 
 letbinding :: Parser Expr
 letbinding = do
   symbol $ key "let"
   name <- typed name
   symbol $ char '='
-  val <- exprParser
+  val <- parser
   symbol $ key "in"
-  expr <- exprParser
+  expr <- parser
   return (Let name val expr) <?> "let binding"
 
 function :: Parser Expr
@@ -85,7 +110,7 @@ function = do
   symbol $ (char '\\' <|> char '\x3bb')
   vars <- manyIdents
   symbol $ (string "->" <|> string "\x2192")
-  expr <- exprParser
+  expr <- parser
   case vars of
     [] -> fail "functions must have at least one parameter (\\ -> ... is not allowed)"
     xs -> return (Val (Func xs expr)) <?> "function literal"
@@ -99,25 +124,25 @@ function = do
 ifThenElse :: Parser Expr
 ifThenElse = do
   symbol $ key "if"
-  i <- exprParser
+  i <- parser
   symbol $ key "then"
-  t <- exprParser
+  t <- parser
   symbol $ key "else"
-  e <- exprParser
+  e <- parser
   return (If i t e) <?> "if-then-else"
 
 number :: Parser Word64
 number = symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal) <?> "number"
 
-paren :: Parser (Typed Expr)
+paren :: Parsable a => Parser a
 paren = do
   symbol $ char '('
-  expr <- exprParser
+  expr <- parser
   symbol $ char ')'
   return expr
 
 keywords :: [String]
-keywords = ["val", "let", "in", "unit", "true", "false", "if", "then", "else"]
+keywords = ["val", "let", "in", "unit", "true", "false", "if", "then", "else", "_"]
 
 data OpKind
   = Wide
@@ -160,10 +185,31 @@ name :: Parser Name
 name = Name <$> identifier
 
 typed :: Parser a -> Parser (Typed a)
-typed x = do
-  new <- x
-  ty <- newType
-  return (new ::: ty)
+typed p = (:::) <$> p <*> newType
+
+maybeRetype :: Parser (Typed a) -> Parser (Typed a)
+maybeRetype p = ascribe <$> p <*> parseAscription
+
+parseAscription :: Parser (Maybe Type)
+parseAscription = (<|> return Nothing) $ do
+  try $ symbol $ char ':'
+  Just <$> parser
+
+ascribe :: Typed a -> (Maybe Type) -> Typed a
+ascribe (x ::: old) (Just new) =
+  case earlyUnify old new of
+    Just ty -> (x ::: ty)
+    Nothing -> error ("cannot ascribe type " ++ show new ++ " to expression of type " ++ show old)
+ascribe expr Nothing = expr
+
+earlyUnify :: Type -> Type -> Maybe Type
+earlyUnify (TAnon _) t = Just t
+earlyUnify t (TAnon _) = Just t
+earlyUnify (TFunc a0 b0) (TFunc a1 b1) =
+  TFunc <$> earlyUnify a0 a1 <*> earlyUnify b0 b1
+earlyUnify a b
+  | a == b    = Just a
+  | otherwise = Nothing
 
 newType :: Monad m => StateT Word64 m Type
 newType = do
@@ -181,28 +227,32 @@ key w = do
   else
     return ()
 
+reservedOps :: [String]
+reservedOps = [":", "."]
+
 operator :: Parser String
-operator = (some $ oneOf "+-*/%^!=<>:?|&~$.") <?> "operator"
+operator = do
+  op <- (some $ oneOf "+-*/%^!=<>:?|&~$.") <?> "operator"
+  if op `elem` reservedOps then
+    fail ("keyword operator (" ++ op ++ ") not allowed here")
+  else
+    return op
 
 operatorInContext :: Parser (String, OpKind)
-operatorInContext = try wide <|> try prefix <|> try postfix <|> compact
+operatorInContext = widePrefix <|> postfixCompact
   where
-    wide = do
-      sc
-      op <- operator
+    followed k = do
       lookAhead sc
-      return (op, Wide)
-    prefix = do
-      sc
+      return k
+    widePrefix = do
+      try sc
       op <- operator
-      return (op, Prefix)
-    postfix = do
+      kind <- followed Wide <|> return Prefix
+      return (op, kind)
+    postfixCompact = do
       op <- operator
-      lookAhead sc
-      return (op, Postfix)
-    compact = do
-      op <- operator
-      return (op, Compact)
+      kind <- followed Postfix <|> return Compact
+      return (op, kind)
 
 lineCmnt :: Parser ()
 lineCmnt = L.skipLineComment "--"
@@ -244,7 +294,8 @@ adjustPrec _ (p, a) = (p+offset, a)
 
 precTable :: [([String], (Prec, Assoc))]
 precTable =
-  [ (["||"], (2, ARight)),
+  [ (["->"], (0, ARight)),
+    (["||"], (2, ARight)),
     (["&&"], (3, ARight)),
     (["==", "!=", "<", "<=", ">", ">="], (4, ANon)),
     (["::"], (5, ARight)),

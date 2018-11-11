@@ -32,16 +32,17 @@ startCompile path = do
   file <- readFile path
   putStr $ dropWhile ('\n' ==) file
   header "parsed"
-  let parser = runStateT manyDeclEnd 0
+  let parser = runStateT declsParser 0
   case runParser parser path file of
     Left err -> putStr ("SYNTAX ERROR: " ++ parseErrorPretty err) >> exitFailure
-    Right (vals, nextAnon) -> do
-      putStr $ unlines $ map show vals
+    Right (decls, nextAnon) -> do
+      let vals = valDecls decls
+      putStr $ unlines $ map showValDecl $ vals
       header "inferred"
-      case inferAll nextAnon $ declToList vals of
+      case inferAll nextAnon vals of
         Left err -> putStrLn ("TYPE ERROR: " ++ err) >> exitFailure
         Right inferred -> do
-          putStr $ unlines $ map show $ declFromList inferred
+          putStr $ unlines $ map showValDecl inferred
           header "evaluate"
           case evaluateAll inferred of
             Left err -> putStrLn ("ERROR: " ++ err) >> exitFailure
@@ -129,17 +130,18 @@ startCompile path = do
 -- noexpr :: IO ReplState
 -- noexpr = putStrLn "unexpected expression after command" >> return Ignore
 
-manyDeclEnd :: Parser [Decl]
-manyDeclEnd = followedByEnd manyDecl
+declsParser :: Parser Decls
+declsParser = followedByEnd manyDecl
   where
-    someDecl = do
-      decl <- declParser
+    someDecl = valDecl
+    valDecl = do
+      decl <- try valDeclParser
       others <- manyDecl
-      return (decl : others)
-    manyDecl = try someDecl <|> return []
+      return $ others { valDecls = decl : valDecls others }
+    manyDecl = try someDecl <|> return emptyDecls
 
 exprParserEnd :: Parser (Typed Expr)
-exprParserEnd = followedByEnd exprParser
+exprParserEnd = followedByEnd parser
 
 followedByEnd :: Parser a -> Parser a
 followedByEnd p = do
