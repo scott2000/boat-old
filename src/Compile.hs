@@ -9,7 +9,9 @@ import Run (getInstanceOfValue)
 
 import qualified LLVM.AST as LLVM
 import qualified LLVM.AST.Typed as LLVM
+import qualified LLVM.AST.Instruction as LLVM
 import qualified LLVM.AST.FunctionAttribute as FnAttr
+import qualified LLVM.AST.ParameterAttribute as ParamAttr
 import qualified LLVM.AST.Constant as C
 import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.Linkage as L
@@ -45,13 +47,11 @@ import qualified Data.Set as Set
 Current Goals:
 
 - add `rec` keyword for tail recursion
-- use fastcc calling convention
 - add generalized tuples and tuple extensions
 - algebraic data types
 
 Possible Future Optimizations:
 
-- add No Signed Wrap (NSW) flag for reference count increments
 - statically optimized currying
     (not using application)
 - replacement of recursion for top-level values with `rec` keyword where applicable
@@ -110,9 +110,6 @@ newCodegen values wordSize = Codegen
     getDebugTrap = Nothing,
     getStringCount = 0,
     getFunctionName = "main" }
-
-localHidden :: L.Linkage
-localHidden = if debugMode then L.External else L.Private
 
 allValues :: BuilderState [Name]
 allValues = (map fst) <$> (gets values)
@@ -180,7 +177,7 @@ genMain main = do
       block `named` "entry"
       res <- genVal mainArgs [] main `named` "main.res"
       printf (" => " ++ tyFmt retType) [res]
-      rcDec (-1) res retType
+      rcDec 1 res retType
       ret (lcint 32 0)
     (retType, mainArgs) =
       case typeof main of
@@ -209,8 +206,8 @@ genExpr app env (expr ::: ty) =
       let bTy = typeof b
       a <- genExpr [] env a `named` "lhs"
       b <- genExpr [] env b `named` "rhs"
-      rcDec (-1) a aTy
-      rcDec (-1) b bTy
+      rcDec 1 a aTy
+      rcDec 1 b bTy
       r <- genOp op a b
       genApp ty app r
     If (Val (Bool b) ::: _) t e ->
@@ -245,7 +242,7 @@ toLocalEnv = map (\(x, _) -> (x, 0))
 
 genStaticCall :: [Operand] -> ClosureData -> Builder Operand
 genStaticCall args closureData =
-  call (getFunc closureData) (map (\x -> (x, [])) args)
+  llvmFastCall (getFunc closureData) (map (\x -> (x, [])) args)
 
 genApp :: Type -> [Operand] -> Operand -> Builder Operand
 genApp _  [] val = return val
@@ -296,15 +293,16 @@ fnInc i closure = do
     Nothing -> do
       incrementer <-
         lift $ llvmFn $ newFn
-          { fnLinkage = localHidden,
-            fnName = "fn.inc",
+          { fnName = "fn.inc",
+            fnLinkage = L.Private,
+            fnCC = CC.Fast,
             fnRetTy = void,
             fnParams = [(funcTy, ParameterName "closure"), (LLVM.IntegerType wordSize, ParameterName "inc")],
             fnBody = Just body }
       lift $ modify $ \s -> s { getFnInc = Just incrementer }
       return incrementer
     Just incrementer -> return incrementer
-  call incrementer [(closure, []), (lcint wordSize $ toInteger i, [])]
+  llvmFastCall incrementer [(closure, []), (lcint wordSize $ toInteger i, [])]
   return ()
   where
     body :: [Operand] -> Builder ()
@@ -318,7 +316,7 @@ fnInc i closure = do
       wordSize <- lift $ gets getWordSize
       rcPtr <- bitcast dataPtr (ptr $ LLVM.IntegerType wordSize) `named` "rc.ptr"
       rc <- load rcPtr 0 `named` "rc"
-      newRc <- add rc inc `named` "rc.new"
+      newRc <- addNUW rc inc `named` "rc.new"
       store rcPtr 0 newRc
       retVoid
 
@@ -333,15 +331,16 @@ fnDec i closure = do
     Nothing -> do
       decrementer <-
         lift $ llvmFn $ newFn
-          { fnLinkage = localHidden,
-            fnName = "fn.dec",
+          { fnName = "fn.dec",
+            fnLinkage = L.Private,
+            fnCC = CC.Fast,
             fnRetTy = void,
-            fnParams = [(funcTy, ParameterName "closure"), (LLVM.IntegerType wordSize, ParameterName "inc")],
+            fnParams = [(funcTy, ParameterName "closure"), (LLVM.IntegerType wordSize, ParameterName "dec")],
             fnBody = Just body }
       lift $ modify $ \s -> s { getFnDec = Just decrementer }
       return decrementer
     Just decrementer -> return decrementer
-  call decrementer [(closure, []), (lcint wordSize $ toInteger i, [])]
+  llvmFastCall decrementer [(closure, []), (lcint wordSize $ toInteger i, [])]
   return ()
   where
     body :: [Operand] -> Builder ()
@@ -355,7 +354,7 @@ fnDec i closure = do
       wordSize <- lift $ gets getWordSize
       rcPtr <- bitcast dataPtr (ptr $ LLVM.IntegerType wordSize) `named` "rc.ptr"
       rc <- load rcPtr 0 `named` "rc"
-      newRc <- add rc inc `named` "rc.new"
+      newRc <- subNUW rc inc `named` "rc.new"
       zero <- icmp ICMP.EQ newRc (lcint 32 0) `named` "rc.zero"
       condBr zero destroy keep
 
@@ -365,7 +364,7 @@ fnDec i closure = do
       destructorList <- bitcast funcPtr (ptr $ ptr destructorTy) `named` "destructors"
       destructorPtr <- gep destructorList [arity] `named` "destructor.ptr"
       destructor <- load destructorPtr 0 `named` "destructor"
-      call destructor [(dataPtr, [])]
+      llvmFastCall destructor [(dataPtr, [])]
       retVoid
 
       keep <- block `named` "keep"
@@ -408,10 +407,10 @@ genIf i t e diffs = mdo
   phi [(thenRes, thenEndBlock), (elseRes, elseEndBlock)]
   where
     thenDec (o ::: ty, n)
-      | n < 0     = rcDec n o ty
+      | n < 0     = rcDec (-n) o ty
       | otherwise = return ()
     elseDec (o ::: ty, n)
-      | n > 0     = rcDec (-n) o ty
+      | n > 0     = rcDec n o ty
       | otherwise = return ()
 
 genOp :: String -> Operand -> Operand -> Builder Operand
@@ -485,7 +484,7 @@ buildStaticClosure free params expr = mdo
         localEnv = toLocalEnv env
         localInc (name, inc)
           | isFree name = rcInc inc o ty
-          | inc == 0    = rcDec (-1) o ty
+          | inc == 0    = rcDec 1 o ty
           | inc == 1    = return ()
           | otherwise   = rcInc (inc-1) o ty
           where
@@ -495,11 +494,13 @@ buildStaticClosure free params expr = mdo
     len = length anons
     paramType (Name name ::: ty) = (genTy ty, fromString name)
     returnType = genTy $ typeof expr
+    nameBase = currentValue ++ "." ++ show len ++ "."
   put (codegen { anonymousFunctions = result : anons })
   func <-
     llvmFn $ newFn
-      { fnLinkage = localHidden,
-        fnName = "func." ++ currentValue ++ "." ++ show len ++ ".",
+      { fnName = "func." ++ nameBase,
+        fnLinkage = L.Private,
+        fnCC = CC.Fast,
         fnRetTy = returnType,
         fnParams = map paramType combinedArgs,
         fnBody = Just body }
@@ -519,7 +520,7 @@ buildStaticClosure free params expr = mdo
             varPtr <- gep castPtr [lcint 32 0, lcint 32 n] `named` "free.ptr"
             load varPtr 0 `named` "free"
         sequence $ map loadFree [1 .. toInteger (length free)]
-      res <- call func (map (\x -> (x, [])) (loadedFrees ++ args)) `named` "forward"
+      res <- llvmFastCall func (map (\x -> (x, [])) (loadedFrees ++ args)) `named` "forward"
       ret res
       where
         iter p a []     = return (a, p)
@@ -533,8 +534,9 @@ buildStaticClosure free params expr = mdo
           iter next (param:a) xs
   fwd <-
     llvmFn $ newFn
-      { fnLinkage = localHidden,
-        fnName = "fwd." ++ currentValue ++ "." ++ show len ++ ".",
+      { fnName = "fwd." ++ nameBase,
+        fnLinkage = L.Private,
+        fnCC = CC.Fast,
         fnPrefix =
           if null destructors then
             Nothing
@@ -584,7 +586,7 @@ buildDestructorNA frees
       | isRc ty = do
         ptr <- gep castPtr [lcint 32 0, lcint 32 n] `named` "ptr"
         val <- load ptr 0 `named` "val"
-        rcDec (-1) val ty
+        rcDec 1 val ty
       | otherwise = return ()
 
 buildDestructor :: [Type] -> [Type] -> BuilderState C.Constant
@@ -607,7 +609,7 @@ buildDestructor (args@(t:ts)) frees
       if isRc t then do
         ptr <- gep castPtr [lcint 32 0, lcint 32 1] `named` "ptr"
         val <- load ptr 0 `named` "val"
-        rcDec (-1) val t
+        rcDec 1 val t
       else return ()
       if null ts && null frees
         then do
@@ -625,7 +627,7 @@ buildDestructor (args@(t:ts)) frees
           yes <- block `named` "yes"
           nextDestructor <- lift $ buildDestructor ts frees
           cast <- bitcast next (ptr i8) `named` "next.cast"
-          call (LLVM.ConstantOperand nextDestructor) [(cast, [])]
+          llvmFastCall (LLVM.ConstantOperand nextDestructor) [(cast, [])]
           retVoid
 
           no <- block `named` "no"
@@ -643,6 +645,7 @@ genDestructor label name body = do
   destructor <-
     llvmFn $ newFn
       { fnName = name,
+        fnCC = CC.Fast,
         fnRetTy = void,
         fnParams = [(ptr i8, "data.ptr")],
         fnBody = Just body }
@@ -691,15 +694,16 @@ genCaller output body closure arg = do
     Nothing -> do
       caller <-
         lift $ llvmFn $ newFn
-          { fnLinkage = localHidden,
-            fnName = "caller." ++ show index ++ ".",
+          { fnName = "caller." ++ show index ++ ".",
+            fnLinkage = L.Private,
+            fnCC = CC.Fast,
             fnRetTy = retty,
             fnParams = [(funcTy, ParameterName "closure"), (argty, ParameterName "arg")],
             fnBody = Just body }
       lift $ modify $ \s -> s { getCallers = Map.insert key caller m }
       return caller
     Just caller -> return caller
-  call caller [(closure, []), (arg, [])]
+  llvmFastCall caller [(closure, []), (arg, [])]
 
 genCallClosureNF :: LLVM.Type -> Operand -> Operand -> Builder Operand
 genCallClosureNF retType =
@@ -709,8 +713,8 @@ genCallClosureNF retType =
     dataPtr <- extractValue closure [2] `named` "data.ptr"
     let funcTy = LLVM.FunctionType retType [ptr i8, LLVM.typeOf arg] False
     castFunc <- bitcast funcPtr (ptr funcTy) `named` "func.cast"
-    res <- call castFunc [(dataPtr, []), (arg, [])] `named` "res"
-    fnDec (-1) closure
+    res <- llvmFastCall castFunc [(dataPtr, []), (arg, [])] `named` "res"
+    fnDec 1 closure
     ret res
 
 genCallClosure :: Operand -> Operand -> Builder Operand
@@ -728,8 +732,8 @@ genCallClosure =
     funcPtr <- extractValue closure [0] `named` "func.ptr"
     let castTy = LLVM.FunctionType funcTy [ptr i8, LLVM.typeOf arg] False
     castFunc <- bitcast funcPtr (ptr castTy) `named` "func.cast"
-    thenRes <- call castFunc [(dataPtr, []), (arg, [])] `named` "res.sat"
-    fnDec (-1) closure
+    thenRes <- llvmFastCall castFunc [(dataPtr, []), (arg, [])] `named` "res.sat"
+    fnDec 1 closure
     ret thenRes
 
     -- For unsaturated calls, the rc doesn't need to be decremented because
@@ -981,3 +985,27 @@ newFn = FunctionHelper
     fnVarargs = False,
     fnAttrs = [],
     fnBody = Nothing }
+
+llvmFastCall :: Operand -> [(Operand, [ParamAttr.ParameterAttribute])] -> Builder Operand
+llvmFastCall func args =
+  let
+    instr = LLVM.Call
+      { LLVM.tailCallKind = Just (LLVM.Tail),
+        LLVM.callingConvention = CC.Fast,
+        LLVM.returnAttributes = [],
+        LLVM.function = Right func,
+        LLVM.arguments = args,
+        LLVM.functionAttributes = [],
+        LLVM.metadata = [] }
+  in
+    case LLVM.typeOf func of
+        LLVM.PointerType (LLVM.FunctionType r _ _) _ -> case r of
+          LLVM.VoidType -> emitInstrVoid instr >> (pure (LLVM.ConstantOperand (C.Undef void)))
+          _ -> emitInstr r instr
+        _ -> error "function call expected function pointer"
+
+addNUW :: Operand -> Operand -> Builder Operand
+addNUW a b = emitInstr (LLVM.typeOf a) $ LLVM.Add False True a b []
+
+subNUW :: Operand -> Operand -> Builder Operand
+subNUW a b = emitInstr (LLVM.typeOf a) $ LLVM.Sub False True a b []
