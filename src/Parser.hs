@@ -21,7 +21,7 @@ class Parsable a where
   parsedApp :: a -> a -> Parser a
 
 valDeclParser :: Parser (Name, Typed Expr)
-valDeclParser = do
+valDeclParser = label "declaration" $ do
   try $ symbol $ key "val"
   name <- name
   ty <- parseAscription
@@ -33,7 +33,7 @@ parser :: Parsable a => Parser a
 parser = symbol $ (parserPrec minPrec)
 
 instance Parsable (Typed Expr) where
-  parsePartial = maybeRetype $ try paren
+  parsePartial = label "expression" $ maybeRetype $ try paren
     <|> try (typed function)
     <|> try (typed letbinding)
     <|> try (typed ifThenElse)
@@ -49,7 +49,7 @@ instance Parsable (Typed Expr) where
   parsedApp a b = typed $ return $ App a b
 
 instance Parsable Type where
-  parsePartial = try paren
+  parsePartial = label "type" $ try paren
     <|> try (tIdVar <$> identifier)
     <|> (symbol $ key "_" >> newType)
 
@@ -113,7 +113,7 @@ function = do
   expr <- parser
   case vars of
     [] -> fail "functions must have at least one parameter (\\ -> ... is not allowed)"
-    xs -> return (Val (Func xs expr)) <?> "function literal"
+    xs -> return (Val (Func xs expr))
   where
     someIdents = do
       ident <- typed name
@@ -129,7 +129,7 @@ ifThenElse = do
   t <- parser
   symbol $ key "else"
   e <- parser
-  return (If i t e) <?> "if-then-else"
+  return (If i t e)
 
 number :: Parser Word64
 number = symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal) <?> "number"
@@ -168,13 +168,13 @@ word :: Parser String
 word = do
   first <- satisfy isIdentFirst
   rest <- takeWhileP Nothing isIdentRest
-  return (first:rest) <?> "identifier"
+  return (first:rest)
   where
     isIdentFirst x = (isAlpha x || x == '_') && isAscii x
     isIdentRest x = (isAlpha x || isDigit x || x == '_') && isAscii x
 
 identifier :: Parser String
-identifier = symbol $ do
+identifier = label "identifier" $ symbol $ do
   ident <- word
   if ident `elem` keywords then
     fail ("expected an identifier, found keyword `" ++ ident ++ "`")
@@ -218,7 +218,7 @@ newType = do
   return (TAnon var)
 
 key :: String -> Parser ()
-key w = do
+key w = label w $ do
   ident <- word
   if ident /= w then
     fail ("expected keyword `" ++ w ++ "`, found `" ++ ident ++ "`")
@@ -239,7 +239,7 @@ operator = do
     return op
 
 operatorInContext :: Parser (String, OpKind)
-operatorInContext = widePrefix <|> postfixCompact
+operatorInContext = label "operator" $ widePrefix <|> postfixCompact
   where
     followed k = do
       lookAhead sc
@@ -255,10 +255,10 @@ operatorInContext = widePrefix <|> postfixCompact
       return (op, kind)
 
 lineCmnt :: Parser ()
-lineCmnt = L.skipLineComment "--"
+lineCmnt = hidden $ L.skipLineComment "--"
 
 blockCmnt :: Parser ()
-blockCmnt = L.skipBlockCommentNested "{-" "-}"
+blockCmnt = hidden $ L.skipBlockCommentNested "{-" "-}"
 
 minPrec :: (Prec, Assoc)
 minPrec = (-1, ANon)

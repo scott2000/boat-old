@@ -64,7 +64,9 @@ executable birch
                        text >= 1.2 && < 2.0,
                        llvm-hs >= 6.3 && <7.0,
                        llvm-hs-pure >= 6.2 && <7.0,
-                       llvm-hs-pretty >= 0.5 && <0.6
+                       llvm-hs-pretty >= 0.5 && <0.6,
+                       ansi-terminal >= 0.8 && <0.9,
+                       haskeline >= 0.7 && <0.8
 
   -- Directories containing source files.
   hs-source-dirs:      src

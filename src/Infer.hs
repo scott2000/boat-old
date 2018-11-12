@@ -41,8 +41,8 @@ type QuantifyState = State (InferMap, Int)
 type DepEntry = (Name, Set.Set Name)
 type MultiDepEntry = (Set.Set Name, Set.Set Name)
 
-inferAll :: Word64 -> Env (Typed Expr) -> Either String (Env (Typed Expr))
-inferAll _ [] = Right []
+inferAll :: Word64 -> Env (Typed Expr) -> Either String (Env (Typed Expr), Word64)
+inferAll count [] = Right ([], count)
 inferAll count globals = do
   let allDeps = depList True globals
   let grouped = groupCycles allDeps
@@ -53,7 +53,7 @@ inferAll count globals = do
   quantified <- sequence $ map (quantifyVerify 0) inferred
   let funcDeps = depList False quantified
   checkRecursiveDeps funcDeps
-  return quantified
+  return (quantified, count)
   where
     inferEach :: Word64
               -> [Env (Typed Expr)]
@@ -392,12 +392,12 @@ unify a b = do
       if a == b then
         return ()
       else
-        lift $ Left ("cannot unify named types `" ++ show a ++ "` and `" ++ show b ++ "`")
+        lift $ Left ("cannot unify named types `" ++ a ++ "` and `" ++ b ++ "`")
     u (TVar a) (TVar b) =
       if a == b then
         return ()
       else
-        lift $ Left ("cannot unify type variables `" ++ show a ++ "` and `" ++ show b ++ "`")
+        lift $ Left ("cannot unify type variables `" ++ a ++ "` and `" ++ b ++ "`")
     u (TFunc a0 b0) (TFunc a1 b1) = do
       unify a0 a1
       unify b0 b1

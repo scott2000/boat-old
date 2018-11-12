@@ -1,3 +1,5 @@
+{-# LANGUAGE RecordWildCards #-}
+
 module AST
   ( Expr (..),
     Type (..),
@@ -8,6 +10,7 @@ module AST
     Env,
     OpEntry,
     emptyDecls,
+    addValDecl,
     showValDecl,
     deps,
     countLocals,
@@ -95,6 +98,9 @@ instance Show Name where
 emptyDecls :: Decls
 emptyDecls = Decls
   { valDecls = [] }
+
+addValDecl :: (Name, Typed Expr) -> Decls -> Decls
+addValDecl val Decls {..} = Decls { valDecls = val : valDecls, .. }
 
 showValDecl :: (Name, Typed Expr) -> String
 showValDecl (name, val ::: ty) =
