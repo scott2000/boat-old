@@ -103,6 +103,8 @@ addValDecl :: (Name, Typed Expr) -> Decls -> Decls
 addValDecl val Decls {..} = Decls { valDecls = val : valDecls, .. }
 
 showValDecl :: (Name, Typed Expr) -> String
+showValDecl (name, val ::: TAnon _) =
+  "val " ++ show name ++ " = " ++ show val
 showValDecl (name, val ::: ty) =
   "val " ++ show name ++ " : " ++ show ty ++ " = " ++ show val
 

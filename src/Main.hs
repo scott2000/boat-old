@@ -186,11 +186,12 @@ repl = go ""
                                                 ++ show (typeof outputExpr) ++ reset
                                 | otherwise   = str
                               output = typeInfo $ show outputExpr
+                              toExprs (x, y ::: t) = (x, Val y ::: t)
                             lift $ outputStrLn output
                             put $ ReplState
                               { replNextAnon = newAnon,
                                 replNextExpr = replNextExpr+1,
-                                replDecls = replDecls { valDecls = newVals },
+                                replDecls = replDecls { valDecls = map toExprs evaluated },
                                 replFirst = True,
                                 .. }
                             repl
@@ -254,23 +255,26 @@ parseCommands commands =
       outputStrLn "  :help           display this help info"
       outputStrLn "  :clear          clear the display"
       outputStrLn "  :reset          clear and reset all declarations"
+      outputStrLn "  :list [all]     list declarations (`all` includes results)"
       outputStrLn "  :info [on|off]  toggle info"
       outputStrLn "  :quit           exit the repl"
       outputStrLn ""
       return Ignore
     ("clear", _) -> clear >> return Ignore
     ("reset", _) -> clear >> return Reset
+    ("list", "all") -> list True
+    ("list", []) -> list False
+    ("list", _) ->
+      outputError "command `list` expects either no argument or `all`"
     ("info", "on") -> setInfo $ const True
     ("info", "off") -> setInfo $ const False
     ("info", []) -> setInfo not
-    ("info", _) -> lift $ do
-      outputStrLn "command `info` expects either no argument or `on` or `off`"
-      return Ignore
+    ("info", _) ->
+      outputError "command `info` expects either no argument or `on` or `off`"
     ("quit", _) ->
       return Quit
-    (command, _) -> lift $ do
-      outputStrLn ("unknown command: `" ++ command ++ "`")
-      return Ignore
+    (command, _) ->
+      outputError ("unknown command: `" ++ command ++ "`")
   where
     clear = lift $ outputStr "\x1b[3J\x1b[H\x1b[2J"
     separate [] = ([], [])
@@ -280,6 +284,20 @@ parseCommands commands =
         (b, r) = separate xs
       in
         (x:b, r)
+    outputError str = do
+      lift $ outputStrLn (errorFmt ++ "error: " ++ reset ++ str)
+      return Ignore
+
+list :: Bool -> Repl ReplResult
+list a = do
+  decls <- gets replDecls
+  let vals = valDecls decls
+  lift $ sequence_ $ map (outputStrLn . showValDecl) $
+    if a then
+      vals
+    else
+      filter (not . invalidName . show . fst) vals
+  return Ignore
 
 setInfo :: (Bool -> Bool) -> Repl ReplResult
 setInfo f = do
