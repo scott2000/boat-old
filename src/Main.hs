@@ -88,7 +88,18 @@ defaultRepl = ReplState
 
 startRepl :: IO ()
 startRepl = do
-  putStrLn "\nType an expression to parse and evaluate it, type `:help` for options.\n"
+  putStrLn $ unlines $
+    [ "",
+      promptFmt ++ "   ________    ________      ____   __________" ++ reset,
+      promptFmt ++ "  /   __   \\  /   __   \\    /    \\ |___    ___|" ++ reset ++ "   " ++ dullBlue ++ "/|\\" ++ reset,
+      promptFmt ++ "  |  |  |  |  |  |  |  |   /  /\\  \\    |  |" ++ reset ++ "      " ++ dullBlue ++ "/ | \\" ++ reset,
+      promptFmt ++ "  |  |__|  /  |  |  |  |  /  /__\\  \\   |  |" ++ reset ++ "     " ++ dullBlue ++ "/  |  \\" ++ reset,
+      promptFmt ++ "  |   __  |   |  |  |  |  |   __   |   |  |" ++ reset ++ "    " ++ dullBlue ++ "/___|___\\" ++ reset,
+      promptFmt ++ "  |  |  |  \\  |  |  |  |  |  |  |  |   |  |" ++ reset ++ "  " ++ dullBlue ++ "______|______" ++ reset,
+      promptFmt ++ "  |  |__|  |  |  |__|  |  |  |  |  |   |  |" ++ reset ++ "  " ++ dullBlue ++ "\\     |     /" ++ reset,
+      promptFmt ++ "  \\________/  \\________/  |__|  |__|   |__|" ++ reset ++ "   " ++ dullBlue ++ "\\____|____/" ++ reset,
+      "",
+      "Type an expression to parse and evaluate it, type `:help` for options." ]
   let
     settings = Settings
       { complete = noCompletion,
@@ -96,13 +107,18 @@ startRepl = do
         autoAddHistory = True }
   runInputT settings $ evalStateT repl defaultRepl
 
-green, red, reset, errorFmt :: String
+green, red, reset, errorFmt, promptFmt, dullBlue :: String
 green = F.setSGRCode [F.SetColor F.Foreground F.Dull F.Green]
 red = F.setSGRCode [F.SetColor F.Foreground F.Dull F.Red]
 reset = F.setSGRCode [F.Reset]
 errorFmt = F.setSGRCode
   [ F.SetColor F.Foreground F.Vivid F.Red,
     F.SetConsoleIntensity F.BoldIntensity ]
+promptFmt = F.setSGRCode
+  [ F.SetColor F.Foreground F.Vivid F.Blue,
+    F.SetConsoleIntensity F.BoldIntensity ]
+dullBlue = F.setSGRCode
+  [ F.SetColor F.Foreground F.Dull F.Blue ]
 
 repl :: Repl ()
 repl = go ""
@@ -122,11 +138,6 @@ repl = go ""
         replSeparator
           | null continuation = "> "
           | otherwise         = "| "
-        promptFmt = F.setSGRCode
-          [ F.SetColor F.Foreground F.Vivid F.Blue,
-            F.SetConsoleIntensity F.BoldIntensity ]
-        dullBlue = F.setSGRCode
-          [ F.SetColor F.Foreground F.Dull F.Blue ]
         reset = F.setSGRCode
           [ F.Reset ]
       line <- lift $ getInputLine (promptFmt ++ replIntro ++ replSeparator ++ reset)
@@ -250,15 +261,16 @@ parseCommands :: String -> Repl ReplResult
 parseCommands commands =
   case separate commands of
     ("help", _) -> lift $ do
-      outputStrLn ""
-      outputStrLn "Commands: "
-      outputStrLn "  :help           display this help info"
-      outputStrLn "  :clear          clear the display"
-      outputStrLn "  :reset          clear and reset all declarations"
-      outputStrLn "  :list [all]     list declarations (`all` includes results)"
-      outputStrLn "  :info [on|off]  toggle info"
-      outputStrLn "  :quit           exit the repl"
-      outputStrLn ""
+      sequence_ $ map outputStrLn $
+        [ "",
+          "Commands: ",
+          "  :help           display this help info",
+          "  :clear          clear the display",
+          "  :reset          clear and reset all declarations",
+          "  :list [all]     list declarations (`all` includes results)",
+          "  :info [on|off]  toggle info",
+          "  :quit           exit the repl",
+          "" ]
       return Ignore
     ("clear", _) -> clear >> return Ignore
     ("reset", _) -> clear >> return Reset
