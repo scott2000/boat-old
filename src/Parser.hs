@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE NamedFieldPuns #-}
 
-module Parser ( MParser, Parser, Parsable (..), valDeclParser, parser, symbol, sc, sc' ) where
+module Parser ( MParser, Parser, Parsable (..), valDeclParser, dataDeclParser, parser, symbol, sc, sc' ) where
 
 import AST
 
@@ -20,8 +21,11 @@ class Parsable a where
   parsedOp :: String -> a -> a -> Parser a
   parsedApp :: a -> a -> Parser a
 
+keywords :: [String]
+keywords = ["data", "val", "let", "match", "in", "unit", "true", "false", "if", "then", "else", "panic", "_"]
+
 valDeclParser :: Parser (Name, Typed Expr)
-valDeclParser = label "declaration" $ do
+valDeclParser = label "value declaration" $ do
   try $ symbol $ key "val"
   name <- name
   ty <- parseAscription
@@ -29,21 +33,50 @@ valDeclParser = label "declaration" $ do
   expr <- parser
   return (name, ascribe expr ty)
 
+dataDeclParser :: Parser (Name, DataDecl)
+dataDeclParser = label "data declaration" $ do
+  try $ symbol $ key "data"
+  (name, typeParams) <- variant
+  symbol $ string "="
+  variants <- multiline <|> singleline
+  return (name, DataDecl { typeParams = map into typeParams, variants })
+  where
+    into (TVar s) = s
+    into other = error ("data declaration expected type variables, found other type: " ++ show other)
+    multiline = do
+      try $ symbol $ string "|"
+      singleline
+    manyVariants = many $ do
+      try $ symbol $ string "|"
+      variant
+    singleline = (:) <$> variant <*> manyVariants
+
+variant :: Parser (Name, [Type])
+variant = symbol $ do
+  name <- name
+  types <- many (try parserNoSpace)
+  return (name, types)
+
 parser :: Parsable a => Parser a
 parser = symbol $ (parserPrec minPrec)
 
-instance Parsable (Typed Expr) where
-  parsePartial = label "expression" $ maybeRetype $ try paren
-    <|> try (typed function)
-    <|> try (typed letbinding)
-    <|> try (typed ifThenElse)
-    <|> try (typed (Id <$> name))
-    <|> try (symbol $ key "unit" >> return (Val Unit ::: tUnit))
-    <|> try (symbol $ key "true" >> return (Val (Bool True) ::: tBool))
-    <|> try (symbol $ key "false" >> return (Val (Bool False) ::: tBool))
-    <|> (::: tNat) <$> Val <$> Nat <$> number
+parserNoSpace :: Parsable a => Parser a
+parserNoSpace = symbol $ (parserPrec appPrec)
 
-  parsedOp "->" _ _ = error ("cannot use (->) operator in expression")
+instance Parsable (Typed Expr) where
+  parsePartial = label "expression" $ maybeRetype $ paren
+    <|> typed function
+    <|> typed letbinding
+    <|> typed matchbinding
+    <|> typed ifThenElse
+    <|> typed panic
+    <|> try (typed (Id <$> name))
+    <|> try (symbol $ key "unit" >> return (Val Unit ::: TUnit))
+    <|> try (symbol $ key "true" >> return (Val (Bool True) ::: TBool))
+    <|> try (symbol $ key "false" >> return (Val (Bool False) ::: TBool))
+    <|> (::: TNat) <$> Val <$> Nat <$> number
+
+  parsedOp "->" _ _ = fail ("cannot use (->) operator in expression")
   parsedOp op a b = typed $ return $ Op op a b
 
   parsedApp a b = typed $ return $ App a b
@@ -54,9 +87,23 @@ instance Parsable Type where
     <|> (symbol $ key "_" >> newType)
 
   parsedOp "->" a b = return $ TFunc a b
-  parsedOp op _ _ = error ("cannot use (" ++ op ++ ") operator in type")
+  parsedOp op _ _ = fail ("cannot use (" ++ op ++ ") operator in type")
 
-  parsedApp a b = error ("cannot use application in type")
+  parsedApp a b = return $ TApp a b
+
+instance Parsable (Typed Pattern) where
+  parsePartial = label "pattern" $ maybeRetype $ paren
+    <|> try (typed (pIdVar <$> identifier))
+    <|> try (symbol $ key "_" >> typed (return $ PAny Nothing))
+    <|> try (symbol $ key "unit" >> return (PAny Nothing ::: TUnit))
+    <|> try (symbol $ key "true" >> return (PBool True ::: TBool))
+    <|> try (symbol $ key "false" >> return (PBool False ::: TBool))
+    <|> (::: TNat) <$> PNat <$> number
+
+  parsedOp op _ _ = fail ("cannot use (" ++ op ++ ") operator in pattern")
+
+  parsedApp (PCons name xs ::: _) x = typed $ return $ PCons name (xs ++ [x])
+  parsedApp other _ = fail ("cannot apply to (" ++ show other ++ ") in pattern")
 
 parserPrec :: Parsable a => (Prec, Assoc) -> Parser a
 parserPrec = parserBase parsePartial
@@ -95,19 +142,9 @@ sc = hidden $ skipSome $ choice [space1, lineCmnt, blockCmnt]
 sc' :: Parser ()
 sc' = hidden $ skipMany $ choice [space1, lineCmnt, blockCmnt]
 
-letbinding :: Parser Expr
-letbinding = do
-  symbol $ key "let"
-  name <- typed name
-  symbol $ char '='
-  val <- parser
-  symbol $ key "in"
-  expr <- parser
-  return (Let name val expr) <?> "let binding"
-
 function :: Parser Expr
 function = do
-  symbol $ (char '\\' <|> char '\x3bb')
+  try $ symbol $ (char '\\' <|> char '\x3bb')
   vars <- manyIdents
   symbol $ (string "->" <|> string "\x2192")
   expr <- parser
@@ -121,28 +158,66 @@ function = do
       return (ident : others)
     manyIdents = try someIdents <|> return []
 
+letbinding :: Parser Expr
+letbinding = do
+  try $ symbol $ key "let"
+  name <- typed name
+  symbol $ char '='
+  val <- parser
+  symbol $ key "in"
+  expr <- parser
+  return $ Let name val expr
+
+matchbinding :: Parser Expr
+matchbinding = do
+  try $ symbol $ key "match"
+  exprs <- someExprs
+  cases <- some $ parseCase $ length exprs
+  return $ Match exprs cases
+  where
+    parseCase len = do
+      pats <- try somePatterns
+      expr <- parserNoSpace
+      if length pats == len then
+        return (pats, expr)
+      else
+        error "different number of patterns and expressions in match"
+    someExprs = do
+      e <- symbol $ parserNoSpace
+      (e:) <$> manyExprs
+    manyExprs = symbol $ (try (key "in" >> return []) <|> someExprs)
+    somePatterns = do
+      p <- symbol $ parserNoSpace
+      (p:) <$> manyPatterns
+    manyPatterns = symbol $ (try (string "->" >> return []) <|> somePatterns)
+
 ifThenElse :: Parser Expr
 ifThenElse = do
-  symbol $ key "if"
+  try $ symbol $ key "if"
   i <- parser
   symbol $ key "then"
   t <- parser
   symbol $ key "else"
   e <- parser
-  return (If i t e)
+  return $ If i t e
+
+panic :: Parser Expr
+panic = do
+  try $ symbol $ key "panic"
+  msg <- takeWhileP Nothing notNewline
+  return $ Panic $ dropWhile (' ' ==) msg
+  where
+    notNewline ch = ch /= '\n' && ch /= '\r'
 
 number :: Parser Word64
 number = symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal) <?> "number"
 
 paren :: Parsable a => Parser a
 paren = do
-  symbol $ char '('
+  try $ symbol $ char '('
   expr <- parser
   symbol $ char ')'
   return expr
-
-keywords :: [String]
-keywords = ["val", "let", "in", "unit", "true", "false", "if", "then", "else", "_"]
 
 data OpKind
   = Wide

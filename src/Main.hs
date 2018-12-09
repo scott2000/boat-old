@@ -12,18 +12,17 @@ import Compile
 import qualified System.Console.ANSI as F
 
 import System.Console.Haskeline
-import System.Console.Haskeline.Completion
 
 import System.IO (hFlush, stdout, readFile)
 import System.Exit (exitFailure)
 import System.Environment (getArgs)
-import Data.Char
 import Data.Word
 import Data.Maybe
 import Text.Megaparsec
-import Text.Megaparsec.Char
 import Control.Monad.State
-import qualified Data.Map as Map
+
+version :: String
+version = "0.1.0"
 
 main :: IO ()
 main = do
@@ -45,20 +44,21 @@ startCompile path = do
   case runParser parser path file of
     Left err -> putStr (errorFmt ++ "syntax error: " ++ reset ++ parseErrorPretty err) >> flushOut >> exitFailure
     Right (decls, nextAnon) -> do
-      let vals = valDecls decls
-      putStr $ unlines $ map showValDecl $ vals
+      let datas = dataDecls decls
+      putStr $ unlines $ map showDataDecl $ datas
+      putStr $ unlines $ map showValDecl $ valDecls decls
       header "inferred"
-      case inferAll nextAnon vals of
+      case inferAll nextAnon decls of
         Left err -> putStrLn (errorFmt ++ "error: " ++ reset ++ err) >> exitFailure
         Right (inferred, _) -> do
           putStr $ unlines $ map showValDecl inferred
           header "evaluate"
-          case evaluateAll inferred of
+          case evaluateAll inferred datas of
             Left err -> putStrLn (errorFmt ++ "error: " ++ reset ++ err) >> exitFailure
             Right evaluated -> do
               putStr $ unlines $ map (\(n,x) -> show n ++ " : " ++ show (typeof x) ++ " = " ++ show x) evaluated
               header "compiled"
-              compile path evaluated 64
+              compile path evaluated datas 64
   where
     header x = putStrLn ("\n-- " ++ x ++ " --\n")
 
@@ -75,7 +75,8 @@ data ReplResult
   = Quit
   | Ignore
   | Reset
-  | Declare (Name, Typed Expr)
+  | DeclareVal (Name, Typed Expr)
+  | DeclareData (Name, DataDecl)
   | Eval (Typed Expr)
 
 defaultRepl :: ReplState
@@ -90,16 +91,13 @@ startRepl :: IO ()
 startRepl = do
   putStrLn $ unlines $
     [ "",
-      promptFmt ++ "   ________    ________      ____   __________" ++ reset,
-      promptFmt ++ "  /   __   \\  /   __   \\    /    \\ |___    ___|" ++ reset ++ "   " ++ dullBlue ++ "/|\\" ++ reset,
-      promptFmt ++ "  |  |  |  |  |  |  |  |   /  /\\  \\    |  |" ++ reset ++ "      " ++ dullBlue ++ "/ | \\" ++ reset,
-      promptFmt ++ "  |  |__|  /  |  |  |  |  /  /__\\  \\   |  |" ++ reset ++ "     " ++ dullBlue ++ "/  |  \\" ++ reset,
-      promptFmt ++ "  |   __  |   |  |  |  |  |   __   |   |  |" ++ reset ++ "    " ++ dullBlue ++ "/___|___\\" ++ reset,
-      promptFmt ++ "  |  |  |  \\  |  |  |  |  |  |  |  |   |  |" ++ reset ++ "  " ++ dullBlue ++ "______|______" ++ reset,
-      promptFmt ++ "  |  |__|  |  |  |__|  |  |  |  |  |   |  |" ++ reset ++ "  " ++ dullBlue ++ "\\     |     /" ++ reset,
-      promptFmt ++ "  \\________/  \\________/  |__|  |__|   |__|" ++ reset ++ "   " ++ dullBlue ++ "\\____|____/" ++ reset,
-      "",
-      "Type an expression to parse and evaluate it, type `:help` for options." ]
+      "        |\\",
+      "       /| \\         Boat " ++ version,
+      "      /_|  \\",
+      "        |___\\     Type a declaration to add it to the scope,",
+      "  ______|______   type an expression to evaluate it,",
+      "  \\  o  o  o  /   or type `:help` to see available commands.",
+      "   \\_________/" ]
   let
     settings = Settings
       { complete = noCompletion,
@@ -173,7 +171,7 @@ repl = go ""
                   Reset -> do
                     put defaultRepl
                     repl
-                  Declare val
+                  DeclareVal val
                     | invalidName name ->
                       outputError ("cannot declare value with name `" ++ name ++ "`, try `result" ++ drop 3 name ++ "` instead")
                     | otherwise -> do
@@ -181,13 +179,16 @@ repl = go ""
                       repl
                     where
                       name = show $ fst val
+                  DeclareData data' -> do
+                    modify $ \s -> s { replDecls = changeDataDecl data' (replDecls s), replFirst = False }
+                    repl
                   Eval expr -> do
                     ReplState {..} <- get
-                    let newVals = changeVal (Name replRes, expr) $ valDecls replDecls
-                    case inferAll replNextAnon newVals of
+                    let newDecls = changeValDecl (Name replRes, expr) replDecls
+                    case inferAll replNextAnon newDecls of
                       Left err -> outputError err
                       Right (inferred, newAnon) ->
-                        case evaluateAll inferred of
+                        case evaluateAll inferred $ dataDecls newDecls of
                           Left err -> outputError err
                           Right evaluated -> do
                             let
@@ -235,6 +236,9 @@ invalidName _ = False
 changeValDecl :: (Name, Typed Expr) -> Decls -> Decls
 changeValDecl val Decls {..} = Decls { valDecls = changeVal val valDecls, .. }
 
+changeDataDecl :: (Name, DataDecl) -> Decls -> Decls
+changeDataDecl data' Decls {..} = Decls { dataDecls = changeVal data' dataDecls, .. }
+
 changeVal :: Eq k => (k, v) -> [(k, v)] -> [(k, v)]
 changeVal entry [] = [entry]
 changeVal entry (x:xs)
@@ -255,7 +259,7 @@ iterRepl string = do
       return state
 
 parseRepl :: Parser ReplResult
-parseRepl = try (Declare <$> valDeclParser) <|> (Eval <$> parser)
+parseRepl = try (DeclareVal <$> valDeclParser) <|> try (DeclareData <$> dataDeclParser) <|> (Eval <$> parser)
 
 parseCommands :: String -> Repl ReplResult
 parseCommands commands =
@@ -327,7 +331,7 @@ setInfo f = do
           red ++ "info already off" ++ reset
         (True, True) ->
           green ++ "info already on" ++ reset
-  put $ s { replSetInfo = new }
+  put $ s { replSetInfo = new, replFirst = True }
   lift $ outputStrLn msg
   return Ignore
 
@@ -341,11 +345,9 @@ flushOut = hFlush stdout
 declsParser :: Parser Decls
 declsParser = followedByEnd manyDecls
   where
-    someDecls = addValDecl <$> valDeclParser <*> manyDecls
-    manyDecls = try someDecls <|> return emptyDecls
-
-exprParserEnd :: Parser (Typed Expr)
-exprParserEnd = followedByEnd parser
+    decl = addDataDecl <$> dataDeclParser
+      <|> addValDecl <$> valDeclParser
+    manyDecls = try (decl <*> manyDecls) <|> return emptyDecls
 
 followedByEnd :: Parser a -> Parser a
 followedByEnd p = do
