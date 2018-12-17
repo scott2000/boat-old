@@ -1,20 +1,46 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE NamedFieldPuns #-}
 
-module Parser ( MParser, Parser, Parsable (..), valDeclParser, dataDeclParser, parser, symbol, sc, sc' ) where
-
+module Parser where
 import AST
 
 import Data.Void
 import Data.Word
 import Data.Char
 import Control.Monad.State
+import Control.Monad.Reader
 import Text.Megaparsec hiding (State)
 import Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
+import qualified Data.Set as Set
+
+-- The minimum possible indentation
+type LinePosition = Int
+
+-- The number of anonymous types assigned
+type AnonCount = Word64
 
 type MParser = Parsec Void String
-type Parser = StateT Word64 MParser
+type Parser = ReaderT LinePosition (StateT AnonCount MParser)
+
+runCustomParser :: AnonCount -> Parser a -> MParser (a, AnonCount)
+runCustomParser c p = runStateT (runReaderT p 0) c
+
+anyIndent :: Parser a -> Parser a
+anyIndent = withLevel 0
+
+blockOf :: Parser a -> Parser a
+blockOf p = do
+  anySpaceChunk
+  current <- ask
+  level <- (subtract 1 . unPos) <$> L.indentLevel
+  if level < current then
+    error ("block indented less then containing block (" ++ show level ++ " < " ++ show current ++ ")")
+  else
+    withLevel level p
+
+withLevel :: Int -> Parser a -> Parser a
+withLevel level p = lift $ runReaderT p level
 
 class Parsable a where
   parsePartial :: Parser a
@@ -136,11 +162,39 @@ symbol p = sc' >> p
 comment :: Parser ()
 comment = hidden $ skipMany $ choice [lineCmnt, blockCmnt]
 
+whitespace :: Parser ()
+whitespace = void $ takeWhile1P Nothing isSpace
+  where
+    isSpace ' '  = True
+    isSpace '\r' = True
+    isSpace _    = False
+
+indentedNewline :: Parser ()
+indentedNewline = try $ do
+  char '\n'
+  minIndent <- ask
+  parseSpaces minIndent minIndent
+
+parseSpaces :: LinePosition -> LinePosition -> Parser ()
+parseSpaces _        0 = return ()
+parseSpaces original n = token test Set.empty >>= id
+  where
+    test ' '  = Just $ parseSpaces original $ n-1
+    test '\n' = Just $ parseSpaces original original
+    test '\r' = Just $ parseSpaces original n
+    test _    = Nothing
+
+spaceChunk :: Parser ()
+spaceChunk = choice [whitespace, indentedNewline, lineCmnt, blockCmnt]
+
+anySpaceChunk :: Parser ()
+anySpaceChunk =  hidden $ skipMany $ choice [whitespace, void $ char '\n', lineCmnt, blockCmnt]
+
 sc :: Parser ()
-sc = hidden $ skipSome $ choice [space1, lineCmnt, blockCmnt]
+sc = label "whitespace" $ skipSome spaceChunk
 
 sc' :: Parser ()
-sc' = hidden $ skipMany $ choice [space1, lineCmnt, blockCmnt]
+sc' = hidden $ skipMany spaceChunk
 
 function :: Parser Expr
 function = do
@@ -161,10 +215,12 @@ function = do
 letbinding :: Parser Expr
 letbinding = do
   try $ symbol $ key "let"
-  name <- typed name
-  symbol $ char '='
-  val <- parser
-  symbol $ key "in"
+  (name, val) <- anyIndent $ do
+    name <- typed name
+    symbol $ char '='
+    val <- parser
+    symbol $ key "in"
+    return (name, val)
   expr <- parser
   return $ Let name val expr
 
@@ -177,7 +233,7 @@ matchbinding = do
   where
     parseCase len = do
       pats <- try somePatterns
-      expr <- parserNoSpace
+      expr <- blockOf parser
       if length pats == len then
         return (pats, expr)
       else
@@ -194,11 +250,13 @@ matchbinding = do
 ifThenElse :: Parser Expr
 ifThenElse = do
   try $ symbol $ key "if"
-  i <- parser
-  symbol $ key "then"
-  t <- parser
-  symbol $ key "else"
-  e <- parser
+  (i, t) <- anyIndent $ do
+    i <- parser
+    symbol $ key "then"
+    t <- parser
+    symbol $ key "else"
+    return (i, t)
+  e <- blockOf parser
   return $ If i t e
 
 panic :: Parser Expr
@@ -215,9 +273,10 @@ number = symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal) <?> 
 paren :: Parsable a => Parser a
 paren = do
   try $ symbol $ char '('
-  expr <- parser
-  symbol $ char ')'
-  return expr
+  anyIndent $ do
+    expr <- parser
+    symbol $ char ')'
+    return expr
 
 data OpKind
   = Wide
@@ -286,8 +345,8 @@ earlyUnify a b
   | a == b    = Just a
   | otherwise = Nothing
 
-newType :: Monad m => StateT Word64 m Type
-newType = do
+newType :: Parser Type
+newType = lift $ do
   var <- get
   put $ var+1
   return (TAnon var)

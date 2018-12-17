@@ -40,9 +40,9 @@ startCompile path = do
   file <- readFile path
   putStr $ dropWhile ('\n' ==) file
   header "parsed"
-  let parser = runStateT declsParser 0
+  let parser = runCustomParser 0 declsParser
   case runParser parser path file of
-    Left err -> putStr (errorFmt ++ "syntax error: " ++ reset ++ parseErrorPretty err) >> flushOut >> exitFailure
+    Left err -> putStr (errorFmt ++ "syntax error: " ++ reset ++ errorBundlePretty err) >> flushOut >> exitFailure
     Right (decls, nextAnon) -> do
       let datas = dataDecls decls
       putStr $ unlines $ map showDataDecl $ datas
@@ -223,7 +223,6 @@ unfinished str = foldl (<|>) Nothing $ map check [('(', ')'), ('[', ']'), ('{', 
       | otherwise = count' a c xs
 
 invalidName :: String -> Bool
-invalidName "res" = False
 invalidName "res0" = True
 invalidName ('r':'e':'s':'0':_) = False
 invalidName ('r':'e':'s':n)
@@ -248,18 +247,22 @@ changeVal entry (x:xs)
 iterRepl :: String -> Repl ReplResult
 iterRepl (':' : commands) = parseCommands commands
 iterRepl string = do
-  nextAnon <- gets replNextAnon
-  let parser = runStateT (followedByEnd parseRepl) nextAnon
+  ReplState {..} <- get
+  let parser = runCustomParser replNextAnon $ followedByEnd $ parseRepl replNextExpr
   case runParser parser "<repl>" string of
     Left err -> lift $ do
-      outputStr (errorFmt ++ "syntax error: " ++ reset ++ parseErrorPretty err)
+      outputStr (errorFmt ++ "syntax error: " ++ reset ++ errorBundlePretty err)
       return Ignore
     Right (state, nextAnon) -> do
       modify $ \s -> s { replNextAnon = nextAnon }
       return state
 
-parseRepl :: Parser ReplResult
-parseRepl = try (DeclareVal <$> valDeclParser) <|> try (DeclareData <$> dataDeclParser) <|> (Eval <$> parser)
+parseRepl :: Word64 -> Parser ReplResult
+parseRepl n = try (DeclareVal <$> valDeclParser) <|> try (DeclareData <$> dataDeclParser) <|> (Eval <$> parseReplExpr n)
+
+parseReplExpr :: Word64 -> Parser (Typed Expr)
+parseReplExpr 0 = parser
+parseReplExpr n = substitute (Name "res") (Id $ Name ("res" ++ show (n-1))) <$> parser
 
 parseCommands :: String -> Repl ReplResult
 parseCommands commands =
@@ -267,7 +270,11 @@ parseCommands commands =
     ("help", _) -> lift $ do
       sequence_ $ map outputStrLn $
         [ "",
-          "Commands: ",
+          "Tips:",
+          "  - The special identifier `res` refers to the result of the last expression",
+          "  - Blocks surrounded by (), [], or {} can span multiple lines",
+          "",
+          "Commands:",
           "  :help           display this help info",
           "  :clear          clear the display",
           "  :reset          clear and reset all declarations",

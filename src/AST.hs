@@ -82,7 +82,7 @@ instance Show Expr where
   show (App a b) = "(" ++ show a ++ " " ++ show b ++ ")"
   show (If i t e) = "(if " ++ show i ++ " then " ++ show t ++ " else " ++ show e ++ ")"
   show (Let name val expr) = "(let " ++ show name ++ " = " ++ show val ++ " in " ++ show expr ++ ")"
-  show (Match exprs cases) = "(match " ++ intercalate " " (map show exprs) ++ " in " ++ intercalate " " (map showCase cases) ++ ")"
+  show (Match exprs cases) = "(match " ++ intercalate " " (map show exprs) ++ " in\n" ++ intercalate "\n" (map showCase cases) ++ ")"
   show (Panic []) = "(panic\n)"
   show (Panic msg) = "(panic " ++ msg ++ "\n)"
   show (ICons _ variant []) = show variant
@@ -93,7 +93,7 @@ instance Show Expr where
     ++ " " ++ unpack (ppll o) ++ " : " ++ show ty ++ " -} " ++ show expr
 
 showCase :: MatchCase -> String
-showCase (p, e) = intercalate " " (map show p) ++ " -> " ++ show e
+showCase (p, e) = "  " ++ intercalate " " (map show p) ++ " -> " ++ show e
 
 instance Show Type where
   show (TAnon n) = "{" ++ show n ++ "}"

@@ -59,7 +59,7 @@ executable birch
 
   -- Other library packages from which modules are imported.
   build-depends:       base >=4.9 && <4.10,
-                       megaparsec >=6.5 && <6.6,
+                       megaparsec >=7.0 && <7.1,
                        containers >= 0.5 && <0.6,
                        mtl >= 2.2 && <2.3,
                        text >= 1.2 && < 2.0,
