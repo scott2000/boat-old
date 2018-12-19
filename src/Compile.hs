@@ -82,6 +82,7 @@ data Codegen = Codegen
     getStaticAllocs :: Map.Map [C.Constant] C.Constant,
     getDataArrays :: Map.Map ArrayEntry Operand,
     getPtrDestructors :: Map.Map PtrDestructorEntry C.Constant,
+    getStrings :: Map.Map String (Int, Operand),
     getNullDestructor :: Maybe C.Constant,
     getPtrDestructorCaller :: Maybe Operand,
     getFnInc :: Maybe Operand,
@@ -92,7 +93,6 @@ data Codegen = Codegen
     getPrintf :: Maybe Operand,
     getDebugTrap :: Maybe Operand,
     getExit :: Maybe Operand,
-    getStringCount :: !Int,
     getFunctionName :: String }
 
 data ClosureData = ClosureData
@@ -118,6 +118,7 @@ newCodegen values datas wordSize = Codegen
     getStaticAllocs = Map.empty,
     getDataArrays = Map.empty,
     getPtrDestructors = Map.empty,
+    getStrings = Map.empty,
     getNullDestructor = Nothing,
     getPtrDestructorCaller = Nothing,
     getFnInc = Nothing,
@@ -128,7 +129,6 @@ newCodegen values datas wordSize = Codegen
     getPrintf = Nothing,
     getDebugTrap = Nothing,
     getExit = Nothing,
-    getStringCount = 0,
     getFunctionName = "main" }
 
 allValues :: BuilderState [Name]
@@ -1348,20 +1348,17 @@ callFree arg = do
 puts :: String -> Builder ()
 puts string = do
   s <- lift get
-  let count = getStringCount s
-  (count, puts) <- case getPuts s of
+  puts <- case getPuts s of
     Nothing -> do
       puts <-
         lift $ llvmFn $ newFn
           { fnName = "puts",
             fnRetTy = i32,
             fnParams = [(ptr i8, NoParameterName)] }
-      lift $ put $ s { getStringCount = count+1, getPuts = Just puts }
-      return (count, puts)
-    Just puts -> do
-      lift $ put $ s { getStringCount = count+1 }
-      return (count, puts)
-  str <- emitString count string
+      lift $ put $ s { getPuts = Just puts }
+      return puts
+    Just puts -> return puts
+  (count, str) <- emitString string
   call puts [(str, [])] `named` (fromString ("_" ++ show count))
   return ()
 
@@ -1369,8 +1366,7 @@ printf :: String -> [Operand] -> Builder ()
 printf fmt args = do
   s <- lift get
   let wordSize = getWordSize s
-  let count = getStringCount s
-  (count, printf) <- case getPrintf s of
+  printf <- case getPrintf s of
     Nothing -> do
       printf <-
         lift $ llvmFn $ newFn
@@ -1378,25 +1374,31 @@ printf fmt args = do
             fnRetTy = i32,
             fnParams = [(ptr i8, "fmt")],
             fnName = "printf" }
-      lift $ put $ s { getStringCount = count+1, getPrintf = Just printf }
-      return (count, printf)
-    Just printf -> do
-      lift $ put $ s { getStringCount = count+1 }
-      return (count, printf)
-  str <- emitString count (fmt ++ "\n")
+      lift $ put $ s { getPrintf = Just printf }
+      return printf
+    Just printf -> return printf
+  (count, str) <- emitString (fmt ++ "\n")
   call printf ((str, []) : map (\x -> (x, [])) args) `named` (fromString ("_" ++ show count))
   return ()
 
-emitString :: Int -> String -> Builder Operand
-emitString count string = lift $ do
-  global <- llvmGlobal $ newGlobal
-      { globalName = "str." ++ show count,
-        globalLinkage = L.Private,
-        globalUnnamedAddress = True,
-        globalConstant = True,
-        globalType = LLVM.ArrayType (fromIntegral (length asciiString)) i8,
-        globalInitializer = Just (C.Array i8 asciiString) }
-  return $ LLVM.ConstantOperand $ C.BitCast global (ptr i8)
+emitString :: String -> Builder (Int, Operand)
+emitString string = lift $ do
+  s <- get
+  let m = getStrings s
+  case Map.lookup string m of
+    Nothing -> do
+      let count = Map.size m
+      global <- llvmGlobal $ newGlobal
+          { globalName = "str." ++ show count,
+            globalLinkage = L.Private,
+            globalUnnamedAddress = True,
+            globalConstant = True,
+            globalType = LLVM.ArrayType (fromIntegral (length asciiString)) i8,
+            globalInitializer = Just (C.Array i8 asciiString) }
+      let o = (count, LLVM.ConstantOperand $ C.BitCast global (ptr i8))
+      put $ s { getStrings = Map.insert string o m }
+      return o
+    Just o -> return o
   where
     asciiString = map charToByte (string ++ "\0")
     charToByte ch = C.Int 8 (toInteger (fromEnum ch))
