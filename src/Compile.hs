@@ -288,8 +288,9 @@ genExpr app env (expr ::: ty) =
         genExpr app ((name, val ::: ty):env) expr
     Match exprs cases -> mdo
       let gen n expr = (::: typeof expr) <$> genExpr [] env expr `named` fromString ("match.expr." ++ show n)
+      let modify = matchLocals exprs cases localEnv
       vals <- sequence $ zipWith gen [0..] exprs
-      phiCases <- genMatch app env vals cases ok err []
+      phiCases <- genMatch app env modify vals cases ok err []
 
       err <- block `named` "match.err"
       puts "pattern matching failed"
@@ -341,172 +342,176 @@ genExpr app env (expr ::: ty) =
 genMatch ::
          [Operand]
          -> Env (Typed Operand)
+         -> Env Int
          -> [Typed Operand]
          -> [MatchCase]
          -> LLVM.Name
          -> LLVM.Name
          -> [(Operand, LLVM.Name)]
          -> Builder [(Operand, LLVM.Name)]
-genMatch _ _ _ [] _ err bs = do
-  br err
-  return bs
-genMatch app env [] (([], expr):cases) ok err bs = do
-  -- puts (" => " ++ show expr)
-  res <- genExpr app env expr `named` "match.res"
-  name <- currentBlock
-  br ok
-  return ((res, name):bs)
-genMatch app env (allV@((tv@(v ::: vty)):vs)) (allCases@(((p ::: pty):ps, expr):cases)) ok err bs = do
-  -- gen <- lift $ sequence $ map (genTy . typeof) allV
-  -- let
-  --   removePercent [] = []
-  --   removePercent ('%':xs) = '%' : '%' : removePercent xs
-  --   removePercent (x:xs) = x : removePercent xs
-  -- printf ("match " ++ intercalate ", " (map tyFmt gen) ++ " in " ++ intercalate ", " (map (removePercent . showCase) allCases)) $ map valof allV
-  case p of
-    PAny binding -> do
+genMatch app env modify = gen
+  where
+    gen _ [] _ err bs = do
+      br err
+      return bs
+    gen [] (([], expr):cases) ok err bs = do
       let
-        addBinding Nothing expr = IModifyRc False tv expr ::: typeof expr
-        addBinding (Just name) expr = Let (name ::: pty) (ILift v ::: vty) expr ::: typeof expr
-        collectAny (((PAny binding ::: _) : ps, expr):cases) =
-          let (a, r) = collectAny cases in
-          ((ps, addBinding binding expr) : a, r)
-        collectAny other = ([], other)
-        (cases, rest) = collectAny allCases
-      if null rest then
-        genMatch app env vs cases ok err bs
-      else mdo
-        blocks <- genMatch app env vs cases ok cont bs
-        cont <- block `named` "match.cont"
-        genMatch app env allV rest ok err blocks
-    PNat _ -> mdo
-      let
-        collectNat (((PNat n ::: _) : ps, expr):cases) =
-          let (m, r) = collectNat cases in
-          (Map.insertWith (++) n [(ps, expr)] m, r)
-        collectNat other = (Map.empty, other)
-        (cases, rest) = collectNat allCases
-      switch v def branches
-
-      (def, blocks) <-
-        if null rest then
-          return (err, bs)
-        else do
-          def <- block `named` "match.def"
-          blocks <- genMatch app env allV rest ok err bs
-          return (def, blocks)
-
-      let
-        natBranches [] bs = return ([], bs)
-        natBranches ((n, cs):rest) bs = do
-          name <- block `named` fromString ("match.nat." ++ show n)
-          blocks <- genMatch app env vs cs ok def bs
-          (branches, blocks') <- natBranches rest blocks
-          return ((C.Int 64 $ toInteger n, name):branches, blocks')
-      (branches, blocks') <- natBranches (Map.toList cases) blocks
-      return blocks'
-    PBool _ -> mdo
-      let
-        collectBool (((PBool b ::: _) : ps, expr):cases) =
-          let (t, f, r) = collectBool cases in
-          if b then
-            ((ps, expr) : t, f, r)
-          else
-            (t, (ps, expr) : f, r)
-        collectBool other = ([], [], other)
-        (t, f, rest) = collectBool allCases
-      condBr v thenBlock elseBlock
-
-      thenBlock <- block `named` "match.then"
-      blocks <- genMatch app env vs t ok cont bs
-
-      elseBlock <- block `named` "match.else"
-      blocks' <- genMatch app env vs f ok cont blocks
-
-      (cont, blocks'') <-
-        if null rest then
-          return (err, blocks')
-        else mdo
-          cont <- block `named` "match.cont"
-          blocks'' <- genMatch app env allV rest ok err blocks'
-          return (cont, blocks'')
-      return blocks''
-    PCons _ _ -> do
-      variants <- lift $ getDataVariants $ vty
-      case variants of
-        [(name, types)] -> do
+        exprLocals = countLocals expr $ toLocalEnv env
+        decs = zipEnv (-) modify exprLocals
+        dec (name, n)
+          | n == 0 = return ()
+          | otherwise =
+            let (o ::: ty) = fromJust $ lookup name env in
+            rcDec n o ty
+      sequence_ $ map dec decs
+      res <- genExpr app env expr `named` "match.res"
+      name <- currentBlock
+      br ok
+      return ((res, name):bs)
+    gen (allV@((tv@(v ::: vty)):vs)) (allCases@(((p ::: pty):ps, expr):cases)) ok err bs = case p of
+        PAny binding -> do
           let
-            collectCons (((PCons _ l ::: _) : ps, expr):cases) =
-              let (a, r) = collectCons cases in
-              ((l ++ ps, expr) : a, r)
-            collectCons other = ([], other)
-            (cases, rest) = collectCons allCases
-          values <- buildTyped types $ buildExtract v
+            addBinding Nothing expr = IModifyRc False tv expr ::: typeof expr
+            addBinding (Just name) expr = Let (name ::: pty) (ILift v ::: vty) expr ::: typeof expr
+            collectAny (((PAny binding ::: _) : ps, expr):cases) =
+              let (a, r) = collectAny cases in
+              ((ps, addBinding binding expr) : a, r)
+            collectAny other = ([], other)
+            (cases, rest) = collectAny allCases
           if null rest then
-            genMatch app env (values ++ vs) cases ok err bs
+            gen vs cases ok err bs
           else mdo
-            blocks <- genMatch app env (values ++ vs) cases ok cont bs
+            blocks <- gen vs cases ok cont bs
             cont <- block `named` "match.cont"
-            genMatch app env allV rest ok err blocks
-        (_:_) -> mdo
+            gen allV rest ok err blocks
+        PNat _ -> mdo
           let
-            collectCons (((PCons n l ::: _) : ps, expr):cases) =
-              let
-                insert (la, ma) (lb, mb) = (la ++ lb, zipWith (&&) ma mb)
-                (m, r) = collectCons cases
-                isAny (PAny Nothing ::: _) = True
-                isAny (PAny (Just name) ::: _) = countOccurances name expr 0 == 0
-                isAny _ = False
-                expr' = IModifyRc False tv expr ::: typeof expr
-                anyMap = map isAny l
-              in
-                (Map.insertWith insert (find n) ([(l ++ ps, expr')], anyMap) m, r)
-            collectCons other = (Map.empty, other)
-            find = go 0 variants
-            go n ((x, _):xs) name
-              | x == name = n
-              | otherwise = go (n+1) xs name
-            (cases, rest) = collectCons allCases
-          magic <- extractValue v [0] `named` "match.magic"
-          dataPtr <- extractValue v [1] `named` "match.ptr"
-          switch magic def branches
+            collectNat (((PNat n ::: _) : ps, expr):cases) =
+              let (m, r) = collectNat cases in
+              (Map.insertWith (++) n [(ps, expr)] m, r)
+            collectNat other = (Map.empty, other)
+            (cases, rest) = collectNat allCases
+          switch v def branches
 
           (def, blocks) <-
             if null rest then
               return (err, bs)
             else do
               def <- block `named` "match.def"
-              blocks <- genMatch app env allV rest ok err bs
+              blocks <- gen allV rest ok err bs
               return (def, blocks)
 
           let
-            consBranches [] bs = return ([], bs)
-            consBranches ((n, (cs, anyMap)):rest) bs = do
-              name <- block `named` fromString ("match.cons." ++ show n)
-              let types = snd $ variants !! n
-              newValues <-
-                if null types then
-                  return []
-                else do
-                  lltypes <- lift $ sequence $ map genTy types
-                  wordSize <- lift $ gets getWordSize
-                  let ty = ptr (LLVM.StructureType False (LLVM.IntegerType wordSize : lltypes))
-                  castPtr <- bitcast dataPtr ty `named` fromString ("match.ptr." ++ show n)
-                  buildTyped types $ buildGep castPtr
-              let
-                eliminate [] rest = rest
-                eliminate (True:xs) (_:ys) = eliminate xs ys
-                eliminate (_:xs) (y:ys) = y : eliminate xs ys
-                updatedValues = eliminate anyMap newValues
-                modifyExpr [] e = e
-                modifyExpr (v:vs) e = modifyExpr vs (IModifyRc True v e ::: typeof e)
-                updateCase (p, e) = (eliminate anyMap p, modifyExpr updatedValues e)
-                updatedCases = map updateCase cs
-              blocks <- genMatch app env (updatedValues ++ vs) updatedCases ok def bs
-              (branches, blocks') <- consBranches rest blocks
-              return ((C.Int 32 $ toInteger n, name):branches, blocks')
-          (branches, blocks') <- consBranches (Map.toList cases) blocks
+            natBranches [] bs = return ([], bs)
+            natBranches ((n, cs):rest) bs = do
+              name <- block `named` fromString ("match.nat." ++ show n)
+              blocks <- gen vs cs ok def bs
+              (branches, blocks') <- natBranches rest blocks
+              return ((C.Int 64 $ toInteger n, name):branches, blocks')
+          (branches, blocks') <- natBranches (Map.toList cases) blocks
           return blocks'
+        PBool _ -> mdo
+          let
+            collectBool (((PBool b ::: _) : ps, expr):cases) =
+              let (t, f, r) = collectBool cases in
+              if b then
+                ((ps, expr) : t, f, r)
+              else
+                (t, (ps, expr) : f, r)
+            collectBool other = ([], [], other)
+            (t, f, rest) = collectBool allCases
+          condBr v thenBlock elseBlock
+
+          thenBlock <- block `named` "match.then"
+          blocks <- gen vs t ok cont bs
+
+          elseBlock <- block `named` "match.else"
+          blocks' <- gen vs f ok cont blocks
+
+          (cont, blocks'') <-
+            if null rest then
+              return (err, blocks')
+            else mdo
+              cont <- block `named` "match.cont"
+              blocks'' <- gen allV rest ok err blocks'
+              return (cont, blocks'')
+          return blocks''
+        PCons _ _ -> do
+          variants <- lift $ getDataVariants $ vty
+          case variants of
+            [(name, types)] -> do
+              let
+                collectCons (((PCons _ l ::: _) : ps, expr):cases) =
+                  let (a, r) = collectCons cases in
+                  ((l ++ ps, expr) : a, r)
+                collectCons other = ([], other)
+                (cases, rest) = collectCons allCases
+              values <- buildTyped types $ buildExtract v
+              if null rest then
+                gen (values ++ vs) cases ok err bs
+              else mdo
+                blocks <- gen (values ++ vs) cases ok cont bs
+                cont <- block `named` "match.cont"
+                gen allV rest ok err blocks
+            (_:_) -> mdo
+              let
+                collectCons (((PCons n l ::: _) : ps, expr):cases) =
+                  let
+                    insert (la, ma) (lb, mb) = (la ++ lb, zipWith (&&) ma mb)
+                    (m, r) = collectCons cases
+                    isAny (PAny Nothing ::: _) = True
+                    isAny (PAny (Just name) ::: _) = countOccurances name expr 0 == 0
+                    isAny _ = False
+                    expr' = IModifyRc False tv expr ::: typeof expr
+                    anyMap = map isAny l
+                  in
+                    (Map.insertWith insert (find n) ([(l ++ ps, expr')], anyMap) m, r)
+                collectCons other = (Map.empty, other)
+                find = go 0 variants
+                go n ((x, _):xs) name
+                  | x == name = n
+                  | otherwise = go (n+1) xs name
+                (cases, rest) = collectCons allCases
+              magic <- extractValue v [0] `named` "match.magic"
+              dataPtr <- extractValue v [1] `named` "match.ptr"
+              switch magic def branches
+
+              (def, blocks) <-
+                if null rest then
+                  return (err, bs)
+                else do
+                  def <- block `named` "match.def"
+                  blocks <- gen allV rest ok err bs
+                  return (def, blocks)
+
+              let
+                consBranches [] bs = return ([], bs)
+                consBranches ((n, (cs, anyMap)):rest) bs = do
+                  name <- block `named` fromString ("match.cons." ++ show n)
+                  let types = snd $ variants !! n
+                  newValues <-
+                    if null types then
+                      return []
+                    else do
+                      lltypes <- lift $ sequence $ map genTy types
+                      wordSize <- lift $ gets getWordSize
+                      let ty = ptr (LLVM.StructureType False (LLVM.IntegerType wordSize : lltypes))
+                      castPtr <- bitcast dataPtr ty `named` fromString ("match.ptr." ++ show n)
+                      buildTyped types $ buildGep castPtr
+                  let
+                    eliminate [] rest = rest
+                    eliminate (True:xs) (_:ys) = eliminate xs ys
+                    eliminate (_:xs) (y:ys) = y : eliminate xs ys
+                    updatedValues = eliminate anyMap newValues
+                    modifyExpr [] e = e
+                    modifyExpr (v:vs) e = modifyExpr vs (IModifyRc True v e ::: typeof e)
+                    updateCase (p, e) = (eliminate anyMap p, modifyExpr updatedValues e)
+                    updatedCases = map updateCase cs
+                  blocks <- gen (updatedValues ++ vs) updatedCases ok def bs
+                  (branches, blocks') <- consBranches rest blocks
+                  return ((C.Int 32 $ toInteger n, name):branches, blocks')
+              (branches, blocks') <- consBranches (Map.toList cases) blocks
+              return blocks'
 
 getVariantId :: Name -> [(Name, a)] -> Integer
 getVariantId name = go 0

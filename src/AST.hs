@@ -248,26 +248,28 @@ countLocals (expr ::: _) env =
       in
         tail $ countLocals expr env'
     Match exprs cases ->
-      let
-        env' = concat $ map (flip countLocals env) exprs
-        caseToEnv (pats, expr) = drop (length patternEnv) $ newEnv
-          where
-            newEnv = countLocals expr (patternEnv ++ env')
-            patternEnv = map namesToEnv $ allPatternNames pats
-            namesToEnv (name, _) = (name, 0)
-      in
-        combineEnvs $ map caseToEnv cases
+      matchLocals exprs cases $ foldr ($) env $ map countLocals exprs
     Panic _ -> env
     ICons _ _ list ->
       foldr ($) env $ map countLocals list
     ILift _ -> env
     IModifyRc _ _ expr -> countLocals expr env
   where
-    combineEnvs (e:es) = foldr (zipEnv max) e es
     addName name [] = []
     addName name ((e@(n, x)) : xs)
       | n == name = (n, x+1) : xs
       | otherwise = e : addName name xs
+
+matchLocals :: [Typed Expr] -> [MatchCase] -> Env Int -> Env Int
+matchLocals exprs cases env =
+  let
+    caseToEnv (pats, expr) = drop (length patternEnv) $ newEnv
+      where
+        newEnv = countLocals expr (patternEnv ++ env)
+        patternEnv = map namesToEnv $ allPatternNames pats
+        namesToEnv (name, _) = (name, 0)
+  in
+    combineEnvs $ map caseToEnv cases
 
 countOccurances :: Name -> Typed Expr -> Int -> Int
 countOccurances name = go
@@ -289,7 +291,7 @@ countOccurances name = go
         Match exprs cases ->
           let
             x' = foldr ($) x $ map go exprs
-            iterCase (pats, expr) xs
+            iterCase (pats, expr) x
               | name `elem` map fst (allPatternNames pats) = x
               | otherwise = go expr x
           in
@@ -335,6 +337,9 @@ checkFunc [] name value expr = substitute name value expr
 checkFunc ((n ::: _):ns) name value expr
   | n == name = expr
   | otherwise = checkFunc ns name value expr
+
+combineEnvs :: [Env Int] -> Env Int
+combineEnvs (e:es) = foldr (zipEnv max) e es
 
 zipEnv :: (a -> b -> c) -> Env a -> Env b -> Env c
 zipEnv _ [] [] = []

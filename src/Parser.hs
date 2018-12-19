@@ -232,8 +232,7 @@ matchbinding = do
   return $ Match exprs cases
   where
     parseCase len = do
-      pats <- try somePatterns
-      expr <- blockOf parser
+      (pats, expr) <- matchCase
       if length pats == len then
         return (pats, expr)
       else
@@ -242,6 +241,11 @@ matchbinding = do
       e <- symbol $ parserNoSpace
       (e:) <$> manyExprs
     manyExprs = symbol $ (try (key "in" >> return []) <|> someExprs)
+
+matchCase :: Parser MatchCase
+matchCase = do
+  (,) <$> try somePatterns <*> blockOf parser
+  where
     somePatterns = do
       p <- symbol $ parserNoSpace
       (p:) <$> manyPatterns
