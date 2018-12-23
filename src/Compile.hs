@@ -45,12 +45,18 @@ import qualified Data.Map as Map
 Current Goals:
 
 - verification of data types
-- better pattern matching syntax, combine (\...) with (match in ...)
-- compile-time simplification (with gas limit)
+- better multiline repl support
 - add `rec` keyword for tail recursion
-- char, int, float, tuple types
-- string, list literals
+- better error handling (especially in parser)
+- char, int, float types
+- string, list, tuple syntactic sugar
+- compile-time simplification (with gas limit)
+- prefix and suffix operators (use ~ for negation?)
+- module system for multiple files
+- replace Unit and Bool with user-defined types (bools currently won't pattern match)
+- user-defined operators (generalized names)
 - typeclasses and constraints
+- standard library
 
 Possible Future Optimizations:
 
@@ -211,8 +217,7 @@ genVal [] _ (Nat n ::: _) = int64 (toInteger n)
 genVal [] _ (Bool False ::: _) = bit 0
 genVal [] _ (Bool True ::: _) = bit 1
 genVal [] _ (Cons name variant list ::: _) = do
-  let
-    genCons expr = toConstant <$> genVal [] [] expr
+  let genCons expr = toConstant <$> genVal [] [] expr
   args <- sequence $ map genCons list
   datas <- gets datas
   let DataDecl {..} = fromJust $ lookup name datas
@@ -224,6 +229,11 @@ genVal [] _ (Cons name variant list ::: _) = do
         return [C.Int 32 number, C.Null $ ptr i8]
       | otherwise -> do
         global <- staticAlloc args
+        -- TODO fix excessive increments here
+        let rcPtr = LLVM.ConstantOperand $ C.GetElementPtr False global [C.Int 32 0, C.Int 32 0]
+        rc <- load rcPtr 0 `named` "static.rc"
+        newRc <- addNUW rc (lcint 32 1) `named` "static.newRc"
+        store rcPtr 0 newRc
         return [C.Int 32 number, C.BitCast global $ ptr i8]
       where
         number = getVariantId variant variants
@@ -293,8 +303,6 @@ genExpr app env (expr ::: ty) =
       phiCases <- genMatch app env modify vals cases ok err []
 
       err <- block `named` "match.err"
-      puts "pattern matching failed"
-      exit 1
       unreachable
 
       ok <- block `named` "match.ok"
@@ -582,7 +590,7 @@ isRc = go []
       datas <- gets datas
       let DataDecl {..} = fromJust $ lookup name datas
       case variants of
-        [(_, types)] -> anyRc $ flip map types $ typeReplace typeParams l
+        [(_, types)] -> anyRc $ for types $ typeReplace typeParams l
         (_:_) -> return True
 
 tyFmt :: LLVM.Type -> String
@@ -1503,7 +1511,7 @@ llvmFn f = LLVM.ConstantOperand <$> llvmConstFn f
 llvmConstFn :: FunctionHelper -> BuilderState C.Constant
 llvmConstFn FunctionHelper {..} = do
   (params, blocks) <- runIRBuilderT emptyIRBuilder $ do
-    params <- sequence $ flip map fnParams $ \(t, x) -> case x of
+    params <- sequence $ for fnParams $ \(t, x) -> case x of
       NoParameterName -> (,) t <$> fresh
       ParameterName p -> (,) t <$> fresh `named` p
     case fnBody of

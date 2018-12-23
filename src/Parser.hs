@@ -14,8 +14,8 @@ import Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
 import qualified Data.Set as Set
 
--- The minimum possible indentation
-type LinePosition = Int
+-- The minimum possible indentation and whether to parse newlines
+type LinePosition = (Int, Bool)
 
 -- The number of anonymous types assigned
 type AnonCount = Word64
@@ -24,23 +24,26 @@ type MParser = Parsec Void String
 type Parser = ReaderT LinePosition (StateT AnonCount MParser)
 
 runCustomParser :: AnonCount -> Parser a -> MParser (a, AnonCount)
-runCustomParser c p = runStateT (runReaderT p 0) c
-
-anyIndent :: Parser a -> Parser a
-anyIndent = withLevel 0
+runCustomParser c p = runStateT (runReaderT p (0, True)) c
 
 blockOf :: Parser a -> Parser a
 blockOf p = do
-  anySpaceChunk
-  current <- ask
-  level <- (subtract 1 . unPos) <$> L.indentLevel
-  if level < current then
-    error ("block indented less then containing block (" ++ show level ++ " < " ++ show current ++ ")")
+  newLine <- anySpaceChunk
+  current <- fst <$> ask
+  if newLine then do
+    level <- (subtract 1 . unPos) <$> L.indentLevel
+    if level < current then
+      fail ("block indented less then containing block (" ++ show level ++ " < " ++ show current ++ ")")
+    else
+      withLinePos (level, True) p
   else
-    withLevel level p
+    withLinePos (current, False) p
 
-withLevel :: Int -> Parser a -> Parser a
-withLevel level p = lift $ runReaderT p level
+anyIndent :: Parser a -> Parser a
+anyIndent = withLinePos (0, True)
+
+withLinePos :: LinePosition -> Parser a -> Parser a
+withLinePos pos p = lift $ runReaderT p pos
 
 class Parsable a where
   parsePartial :: Parser a
@@ -148,7 +151,7 @@ parserPrec = parserBase parsePartial
               other <- parserPrec newPrec
               parserBase (parsedOp op expr other) prec
         else
-          error ("cannot use operator of kind " ++ show kind ++ " here")
+          error ("cannot use operator (" ++ op ++ ") of kind " ++ show kind ++ " here")
       appExpr expr =
         case precError prec appPrec of
           Just err -> fail err
@@ -171,11 +174,14 @@ whitespace = void $ takeWhile1P Nothing isSpace
 
 indentedNewline :: Parser ()
 indentedNewline = try $ do
-  char '\n'
-  minIndent <- ask
-  parseSpaces minIndent minIndent
+  (minIndent, allow) <- ask
+  if allow then do
+    char '\n'
+    parseSpaces minIndent minIndent
+  else
+    fail "newline not allowed here"
 
-parseSpaces :: LinePosition -> LinePosition -> Parser ()
+parseSpaces :: Int -> Int -> Parser ()
 parseSpaces _        0 = return ()
 parseSpaces original n = token test Set.empty >>= id
   where
@@ -187,8 +193,15 @@ parseSpaces original n = token test Set.empty >>= id
 spaceChunk :: Parser ()
 spaceChunk = choice [whitespace, indentedNewline, lineCmnt, blockCmnt]
 
-anySpaceChunk :: Parser ()
-anySpaceChunk =  hidden $ skipMany $ choice [whitespace, void $ char '\n', lineCmnt, blockCmnt]
+anySpaceChunk :: Parser Bool
+anySpaceChunk = fmap (foldr (||) False) $ hidden $ many $ choice
+  [ whitespace >> return False,
+    char '\n' >> return True,
+    lineCmnt  >> return False,
+    blockCmnt  >> return False ]
+
+lookAheadSpace :: Parser ()
+lookAheadSpace = choice [whitespace, void $ char '\n', lineCmnt, blockCmnt]
 
 sc :: Parser ()
 sc = label "whitespace" $ skipSome spaceChunk
@@ -199,18 +212,30 @@ sc' = hidden $ skipMany spaceChunk
 function :: Parser Expr
 function = do
   try $ symbol $ (char '\\' <|> char '\x3bb')
-  vars <- manyIdents
-  symbol $ (string "->" <|> string "\x2192")
-  expr <- parser
-  case vars of
-    [] -> fail "functions must have at least one parameter (\\ -> ... is not allowed)"
-    xs -> return (Val (Func xs expr))
+  cases <- blockOf $ some $ matchCase
+  case cases of
+    [(pats, expr)] ->
+      case names pats of
+        Just xs -> return $ Val $ Func xs expr
+        Nothing -> caseFunction cases
+    (_:_) -> caseFunction cases
   where
-    someIdents = do
-      ident <- typed name
-      others <- manyIdents
-      return (ident : others)
-    manyIdents = try someIdents <|> return []
+    names [] = Just []
+    names (PAny (Just name) ::: ty : ps) = (name ::: ty :) <$> names ps
+    names _ = Nothing
+    caseFunction cases = do
+      sequence_ $ for tailed $ \(pats, _) ->
+        if length pats /= len then
+          error "different number of patterns in function cases"
+        else
+          return ()
+      return $ Val $ Func (mapTy idents) $ Match (mapTy $ map Id idents) cases ::: t0
+      where
+        ((p0, _ ::: t0) : tailed) = cases
+        len = length p0
+        types = map typeof p0
+        mapTy xs = zipWith (:::) xs types
+        idents = for [0..len-1] $ \n -> Name $ "{-" ++ show n ++ "-}"
 
 letbinding :: Parser Expr
 letbinding = do
@@ -227,8 +252,8 @@ letbinding = do
 matchbinding :: Parser Expr
 matchbinding = do
   try $ symbol $ key "match"
-  exprs <- someExprs
-  cases <- some $ parseCase $ length exprs
+  exprs <- anyIndent someExprs
+  cases <- blockOf $ some $ parseCase $ length exprs
   return $ Match exprs cases
   where
     parseCase len = do
@@ -380,7 +405,7 @@ operatorInContext :: Parser (String, OpKind)
 operatorInContext = label "operator" $ widePrefix <|> postfixCompact
   where
     followed k = do
-      lookAhead sc
+      lookAhead lookAheadSpace
       return k
     widePrefix = do
       try sc

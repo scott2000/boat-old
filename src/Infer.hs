@@ -3,6 +3,7 @@
 module Infer (inferAll, simplify, TypeMap (mapTypes)) where
 
 import AST
+import Verify
 
 import Data.Word
 import Data.List
@@ -76,6 +77,7 @@ inferAll count Decls {..} = do
         simplified = mapTypes (simplify m) expr
       in do
         verifyTypes simplified
+        verifyExpr dataDecls expr
         return (name, simplified)
 
 infer :: Map.Map Name Type
@@ -305,7 +307,7 @@ instance TypeMap Expr where
   mapTypes f (Let name val expr) = Let (mapTypes f name) (mapTypes f val) (mapTypes f expr)
   mapTypes f (Match exprs cases) = Match (map (mapTypes f) exprs) $ map mapCase cases
     where mapCase (pats, expr) = (map (mapTypes f) pats, mapTypes f expr)
-  mapTypes f (ICons name variant list) = ICons name variant $ flip map list $ mapTypes f
+  mapTypes f (ICons name variant list) = ICons name variant $ for list $ mapTypes f
   mapTypes _ other = other
 
   verifyTypes (Val v) = verifyTypes v
@@ -332,7 +334,7 @@ instance TypeMap Expr where
       caseLocals (p, e) = sequence_ (map getLocals p) >> getLocals e
 
 instance TypeMap Value where
-  mapTypes f (Cons name variant list) = Cons name variant $ flip map list $ mapTypes f
+  mapTypes f (Cons name variant list) = Cons name variant $ for list $ mapTypes f
   mapTypes f (Func xs expr) = Func (map (mapTypes f) xs) (mapTypes f expr)
   mapTypes _ other = other
 
@@ -347,7 +349,7 @@ instance TypeMap Value where
   getLocals _ = return ()
 
 instance TypeMap Pattern where
-  mapTypes f (PCons n pats) = PCons n $ flip map pats $ mapTypes f
+  mapTypes f (PCons n pats) = PCons n $ for pats $ mapTypes f
   mapTypes _ other = other
 
   verifyTypes (PCons _ pats) = sequence_ $ map verifyTypes pats
@@ -405,7 +407,7 @@ ty glob env (x ::: fin) = do
     Match exprs cases -> do
       ts <- sequence $ map (ty glob env) exprs
       cs <- sequence $ map casety cases
-      sequence_ $ flip map cs $ \(ps, e) -> do
+      sequence_ $ for cs $ \(ps, e) -> do
         sequence_ $ zipWith unify ts ps
         unify fin e
     Panic msg -> return ()

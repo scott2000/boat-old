@@ -96,7 +96,7 @@ showCase :: MatchCase -> String
 showCase (p, e) = "  " ++ intercalate " " (map show p) ++ " -> " ++ show e
 
 instance Show Type where
-  show (TAnon n) = "{" ++ show n ++ "}"
+  show (TAnon n) = "{-" ++ show n ++ "-}"
   show (TId s) = show s
   show (TVar s) = s
   show TArrow = "(->)"
@@ -164,7 +164,7 @@ constructorsForData (name, DataDecl {..}) = map constructorFor variants
         fty = mkFuncTy types ty
     ty = foldl' TApp (TId name) tvars
     tvars = map TVar typeParams
-    allNames = flip map [0..] $ \x -> Name $ "p" ++ show x
+    allNames = for [0..] $ \x -> Name $ "p" ++ show x
 
 constructorTypesForData :: (Name, DataDecl) -> Env Type
 constructorTypesForData (name, DataDecl {..}) = map typeFor variants
@@ -201,7 +201,7 @@ deps lam env (expr ::: _) =
       let caseDeps (p, e) = deps lam ((map fst $ allPatternNames p) ++ env) e
       sequence_ $ map caseDeps cases
     Panic _ -> return ()
-    ICons _ _ list -> sequence_ $ flip map list $ deps lam env
+    ICons _ _ list -> sequence_ $ for list $ deps lam env
 
 -- TODO verification of non-duplication for pattern names
 patternNames :: Typed Pattern -> Env Type
@@ -321,14 +321,14 @@ substitute name value (expr ::: ty) =
       | n == name -> Let t (substitute name value v) expr
       | otherwise -> Let t (substitute name value v) (substitute name value expr)
     Match exprs cases ->
-      Match (map (substitute name value) exprs) $ flip map cases $ \(p, e) ->
+      Match (map (substitute name value) exprs) $ for cases $ \(p, e) ->
         if name `elem` (map fst $ allPatternNames p) then
           (p, e)
         else
           (p, substitute name value e)
     Panic msg -> Panic msg
     ICons n variant list ->
-      ICons n variant $ flip map list $ substitute name value
+      ICons n variant $ for list $ substitute name value
     ILift o -> ILift o
     IModifyRc isInc o expr -> IModifyRc isInc o expr
 
@@ -403,6 +403,9 @@ pIdVar s =
     PCons (Name s) []
   else
     PAny $ Just $ Name s
+
+for :: [a] -> (a -> b) -> [b]
+for = flip map
 
 pattern TUnit :: Type
 pattern TUnit = TId (Name "Unit")
