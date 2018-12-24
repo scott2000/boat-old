@@ -15,8 +15,8 @@ import qualified LLVM.AST.Constant as C
 import qualified LLVM.AST.CallingConvention as CC
 import qualified LLVM.AST.Linkage as L
 import qualified LLVM.AST.Visibility as V
+import qualified LLVM.AST.IntegerPredicate as ICMP
 import LLVM.AST (Operand)
-import LLVM.AST.IntegerPredicate as ICMP
 import LLVM.AST.AddrSpace
 import LLVM.AST.Type (void, i1, i8, i32, i64, ptr)
 import LLVM.IRBuilder.Constant
@@ -75,8 +75,6 @@ debugMode = False
 
 type DestructorEntry = ([Type], [Type]) -- args, frees
 type FunctionEntry = (LLVM.Type, Maybe LLVM.Type) -- arg, (Just = NF ret, Nothing = function)
-type ArrayEntry = (Bool, [[Type]]) -- isInc, variants
-type PtrDestructorEntry = (Bool, [Type]) -- isInc, types
 
 data Codegen = Codegen
   { anonymousFunctions :: [ClosureData],
@@ -86,12 +84,11 @@ data Codegen = Codegen
     getDestructors :: Map.Map DestructorEntry C.Constant,
     getCallers :: Map.Map FunctionEntry Operand,
     getStaticAllocs :: Map.Map [C.Constant] C.Constant,
-    getDataArrays :: Map.Map ArrayEntry Operand,
-    getPtrDestructors :: Map.Map PtrDestructorEntry C.Constant,
+    getDataArrays :: Map.Map [[Type]] Operand,
+    getPtrDestructors :: Map.Map [Type] C.Constant,
     getStrings :: Map.Map String (Int, Operand),
-    getNullDestructor :: Maybe C.Constant,
     getPtrDestructorCaller :: Maybe Operand,
-    getFnInc :: Maybe Operand,
+    getInc :: Maybe Operand,
     getFnDec :: Maybe Operand,
     getMalloc :: Maybe Operand,
     getFree :: Maybe Operand,
@@ -125,9 +122,8 @@ newCodegen values datas wordSize = Codegen
     getDataArrays = Map.empty,
     getPtrDestructors = Map.empty,
     getStrings = Map.empty,
-    getNullDestructor = Nothing,
     getPtrDestructorCaller = Nothing,
-    getFnInc = Nothing,
+    getInc = Nothing,
     getFnDec = Nothing,
     getMalloc = Nothing,
     getFree = Nothing,
@@ -201,7 +197,7 @@ genMain main = do
   where
     generator _ = do
       block `named` "entry"
-      res <- genVal mainArgs [] main `named` "main.res"
+      res <- genVal False mainArgs [] main `named` "main.res"
       ty <- lift $ genTy retType
       printf (" => " ++ tyFmt ty) [res]
       rcDec 1 res retType
@@ -211,39 +207,45 @@ genMain main = do
         TFunc TUnit r -> (r, [unit])
         r -> (r, [])
 
-genVal :: [Operand] -> Env (Typed Operand) -> Typed Value -> Builder Operand
-genVal [] _ (Unit ::: _) = return unit
-genVal [] _ (Nat n ::: _) = int64 (toInteger n)
-genVal [] _ (Bool False ::: _) = bit 0
-genVal [] _ (Bool True ::: _) = bit 1
-genVal [] _ (Cons name variant list ::: _) = do
-  let genCons expr = toConstant <$> genVal [] [] expr
-  args <- sequence $ map genCons list
-  datas <- gets datas
-  let DataDecl {..} = fromJust $ lookup name datas
-  v <- case variants of
-    [_] ->
-      return args
-    (_:_)
-      | all (isZeroSized . LLVM.typeOf) args ->
-        return [C.Int 32 number, C.Null $ ptr i8]
-      | otherwise -> do
-        global <- staticAlloc args
-        -- TODO fix excessive increments here
-        let rcPtr = LLVM.ConstantOperand $ C.GetElementPtr False global [C.Int 32 0, C.Int 32 0]
-        rc <- load rcPtr 0 `named` "static.rc"
-        newRc <- addNUW rc (lcint 32 1) `named` "static.newRc"
-        store rcPtr 0 newRc
-        return [C.Int 32 number, C.BitCast global $ ptr i8]
-      where
-        number = getVariantId variant variants
-  return $ LLVM.ConstantOperand $ C.Struct Nothing False v
-genVal app env (Func xs expr ::: ty) = do
-  closureData <- lift (getStaticClosureData xs expr)
-  if length (getParameters closureData) == length app then
-    genStaticCall app closureData
-  else do
-    genClosureForData env closureData >>= genApp ty app
+genVal :: Bool -> [Operand] -> Env (Typed Operand) -> Typed Value -> Builder Operand
+genVal isConstant app env (v ::: ty) =
+  case v of
+    Unit -> return unit
+    Nat n -> int64 (toInteger n)
+    Bool False -> bit 0
+    Bool True -> bit 1
+    Cons name variant list -> do
+      datas <- gets datas
+      let DataDecl {..} = fromJust $ lookup name datas
+      v <- case variants of
+        [_] -> do
+          let genCons expr = toConstant <$> genVal isConstant [] [] expr
+          sequence $ map genCons list
+        (_:_) -> do
+          zeroSized <- lift $ allZeroSized $ map typeof list
+          if zeroSized then
+            return [C.Int 32 number, C.Null $ ptr i8]
+          else do
+            let genCons expr = toConstant <$> genVal True [] [] expr
+            args <- sequence $ map genCons list
+            global <- staticAlloc args
+            if isConstant then
+              return ()
+            else do
+              let rcPtr = LLVM.ConstantOperand $ C.GetElementPtr False global [C.Int 32 0, C.Int 32 0]
+              rc <- load rcPtr 0 `named` "static.rc"
+              newRc <- addNUW rc (lcint 32 1) `named` "static.newRc"
+              store rcPtr 0 newRc
+            return [C.Int 32 number, C.BitCast global $ ptr i8]
+          where
+            number = getVariantId variant variants
+      return $ LLVM.ConstantOperand $ C.Struct Nothing False v
+    Func xs expr -> do
+      closureData <- lift (getStaticClosureData xs expr)
+      if length (getParameters closureData) == length app then
+        genStaticCall app closureData
+      else do
+        genClosureForData env closureData >>= genApp ty app
 
 unit :: Operand
 unit = LLVM.ConstantOperand (C.Struct Nothing False [])
@@ -252,7 +254,7 @@ genExpr :: [Operand] -> Env (Typed Operand) -> Typed Expr -> Builder Operand
 genExpr app env (expr ::: ty) =
   case expr of
     Val v ->
-      genVal app env (v ::: ty)
+      genVal False app env (v ::: ty)
     App a b -> do
       arg <- genExpr [] env b `named` "app.arg"
       genExpr (arg:app) env a
@@ -260,7 +262,7 @@ genExpr app env (expr ::: ty) =
       values <- lift $ gets values
       case lookup name values of
         Just val -> do
-          genVal app [] (getInstanceOfValue ty val) `inVal` (show name)
+          genVal False app [] (getInstanceOfValue ty val) `inVal` (show name)
         Nothing ->
           case lookup name env of
             Just (x ::: _) -> genApp ty app x
@@ -300,7 +302,8 @@ genExpr app env (expr ::: ty) =
       let gen n expr = (::: typeof expr) <$> genExpr [] env expr `named` fromString ("match.expr." ++ show n)
       let modify = matchLocals exprs cases localEnv
       vals <- sequence $ zipWith gen [0..] exprs
-      phiCases <- genMatch app env modify vals cases ok err []
+      let genCases = map toGenCase cases
+      phiCases <- genMatch app env modify vals genCases ok err []
 
       err <- block `named` "match.err"
       unreachable
@@ -339,20 +342,63 @@ genExpr app env (expr ::: ty) =
             genStruct [lcint 32 number, dataPtrI8]
           where
             number = getVariantId variant variants
-    ILift o -> return o
-    IModifyRc isInc (o ::: ty) expr -> do
-      rcIncDec isInc 1 o ty
-      genExpr app env expr
   where
     localEnv = toLocalEnv env
     fromEnv (name, count) = (fromJust $ lookup name env, count)
 
-genMatch ::
-         [Operand]
+data GenCase = GenCase
+  { casePats :: [Typed Pattern],
+    caseExpr :: Typed Expr,
+    caseEnv :: Env (Typed Operand),
+    caseMod :: ModMap }
+
+type ModMap = [(Typed Operand, ModEntry)]
+
+data ModEntry = ModEntry
+  { modDirect :: Maybe (C.Constant, Operand),
+    modCount :: Int }
+
+showMod :: ModMap -> String
+showMod m = intercalate "\n  " $ for m $ \(o ::: ty, ModEntry {..}) ->
+  (++ unpack (ppll o) ++ " : " ++ show ty ++ " by " ++ show modCount) $ case modDirect of
+    Just (d, p) -> "direct (" ++ unpack (ppll d) ++ ", " ++ unpack (ppll p) ++ ") "
+    Nothing -> "indirect "
+
+toGenCase :: MatchCase -> GenCase
+toGenCase (pats, expr) = GenCase
+  { casePats = pats,
+    caseExpr = expr,
+    caseEnv = [],
+    caseMod = [] }
+
+addModEntry :: Int -> Typed Operand -> ModMap -> ModMap
+addModEntry 0 _ m = m
+addModEntry i o [] = [(o, entry)]
+  where
+    entry = ModEntry
+      { modDirect = Nothing,
+        modCount = i }
+addModEntry i o ((k, v) : rest)
+  | k == o = (k, v { modCount = modCount v + i }) : rest
+  | otherwise = (k, v) : addModEntry i o rest
+
+addModDirect :: Int -> Typed Operand -> C.Constant -> Operand -> ModMap -> ModMap
+addModDirect i o d p m =
+  case m of
+    [] -> [(o, change 0)]
+    (k, v) : rest
+      | k == o -> (k, change $ modCount v) : rest
+      | otherwise -> (k, v) : addModDirect i o d p rest
+  where
+    change v = ModEntry
+      { modDirect = Just (d, p),
+        modCount = v + i }
+
+genMatch :: [Operand]
          -> Env (Typed Operand)
          -> Env Int
          -> [Typed Operand]
-         -> [MatchCase]
+         -> [GenCase]
          -> LLVM.Name
          -> LLVM.Name
          -> [(Operand, LLVM.Name)]
@@ -362,28 +408,65 @@ genMatch app env modify = gen
     gen _ [] _ err bs = do
       br err
       return bs
-    gen [] (([], expr):cases) ok err bs = do
+    gen [] (GenCase { casePats = [], .. } : cases) ok err bs = do
       let
-        exprLocals = countLocals expr $ toLocalEnv env
+        exprLocals = countLocals caseExpr $ toLocalEnv env
         decs = zipEnv (-) modify exprLocals
-        dec (name, n)
-          | n == 0 = return ()
-          | otherwise =
-            let (o ::: ty) = fromJust $ lookup name env in
-            rcDec n o ty
-      sequence_ $ map dec decs
-      res <- genExpr app env expr `named` "match.res"
+        dec [] m = m
+        dec ((name, 0):rest) m = dec rest m
+        dec ((name, n):rest) m =
+          let o = fromJust $ lookup name env in
+          dec rest $ addModEntry (-n) o m
+        mods = dec decs caseMod
+      wordSize <- gets getWordSize
+      let isize = LLVM.IntegerType wordSize
+      sequence_ $ for mods $ \(o ::: ty, ModEntry {..}) ->
+        if modCount > 0 then
+          case modDirect of
+            Just (C.Null _, _) -> return ()
+            Just (_, dataPtr) ->
+              incPtr modCount dataPtr
+            Nothing ->
+              rcInc modCount o ty
+        else
+          return ()
+      sequence_ $ for mods $ \(o ::: ty, ModEntry {..}) ->
+        if modCount < 0 then
+          case modDirect of
+            Just (C.Null _, _) -> return ()
+            Just (direct, dataPtr) -> do
+              cast <- bitcast dataPtr (ptr isize) `named` "rc.cast"
+              llvmFastCall (LLVM.ConstantOperand direct) [(cast, []), (lcint wordSize $ toInteger (-modCount), [])]
+              return ()
+            Nothing ->
+              rcDec (-modCount) o ty
+        else
+          return ()
+      res <- genExpr app (caseEnv ++ env) caseExpr `named` "match.res"
       name <- currentBlock
       br ok
       return ((res, name):bs)
-    gen (allV@((tv@(v ::: vty)):vs)) (allCases@(((p ::: pty):ps, expr):cases)) ok err bs = case p of
+    gen (allV@((tv@(v ::: vty)):vs)) (allCases@(GenCase { casePats = (p ::: _):_ } : _)) ok err bs = case p of
         PAny binding -> do
           let
-            addBinding Nothing expr = IModifyRc False tv expr ::: typeof expr
-            addBinding (Just name) expr = Let (name ::: pty) (ILift v ::: vty) expr ::: typeof expr
-            collectAny (((PAny binding ::: _) : ps, expr):cases) =
-              let (a, r) = collectAny cases in
-              ((ps, addBinding binding expr) : a, r)
+            collectAny (GenCase { casePats = (PAny binding ::: _) : ps, .. } : cases) =
+              let
+                (a, r) = collectAny cases
+                newCase =
+                  case binding of
+                    Nothing -> GenCase
+                      { casePats = ps,
+                        caseMod = addModEntry (-1) tv caseMod,
+                        .. }
+                    Just name ->
+                      let count = countOccurances name caseExpr 0 in
+                      GenCase
+                        { casePats = ps,
+                          caseEnv = (name, tv) : caseEnv,
+                          caseMod = addModEntry (count-1) tv caseMod,
+                          .. }
+              in
+                (newCase : a, r)
             collectAny other = ([], other)
             (cases, rest) = collectAny allCases
           if null rest then
@@ -394,9 +477,9 @@ genMatch app env modify = gen
             gen allV rest ok err blocks
         PNat _ -> mdo
           let
-            collectNat (((PNat n ::: _) : ps, expr):cases) =
+            collectNat (GenCase { casePats = (PNat n ::: _) : ps, .. } : cases) =
               let (m, r) = collectNat cases in
-              (Map.insertWith (++) n [(ps, expr)] m, r)
+              (Map.insertWith (++) n [GenCase { casePats = ps, .. }] m, r)
             collectNat other = (Map.empty, other)
             (cases, rest) = collectNat allCases
           switch v def branches
@@ -420,12 +503,15 @@ genMatch app env modify = gen
           return blocks'
         PBool _ -> mdo
           let
-            collectBool (((PBool b ::: _) : ps, expr):cases) =
-              let (t, f, r) = collectBool cases in
-              if b then
-                ((ps, expr) : t, f, r)
-              else
-                (t, (ps, expr) : f, r)
+            collectBool (GenCase { casePats = (PBool b ::: _) : ps, .. } : cases) =
+              let
+                (t, f, r) = collectBool cases
+                newCase = GenCase { casePats = ps, .. }
+              in
+                if b then
+                  (newCase : t, f, r)
+                else
+                  (t, newCase : f, r)
             collectBool other = ([], [], other)
             (t, f, rest) = collectBool allCases
           condBr v thenBlock elseBlock
@@ -449,9 +535,9 @@ genMatch app env modify = gen
           case variants of
             [(name, types)] -> do
               let
-                collectCons (((PCons _ l ::: _) : ps, expr):cases) =
+                collectCons (GenCase { casePats = (PCons _ l ::: _) : ps, .. } : cases) =
                   let (a, r) = collectCons cases in
-                  ((l ++ ps, expr) : a, r)
+                  (GenCase { casePats = l ++ ps, .. } : a, r)
                 collectCons other = ([], other)
                 (cases, rest) = collectCons allCases
               values <- buildTyped types $ buildExtract v
@@ -463,17 +549,16 @@ genMatch app env modify = gen
                 gen allV rest ok err blocks
             (_:_) -> mdo
               let
-                collectCons (((PCons n l ::: _) : ps, expr):cases) =
+                collectCons (GenCase { casePats = (PCons n l ::: _) : ps, .. } : cases) =
                   let
                     insert (la, ma) (lb, mb) = (la ++ lb, zipWith (&&) ma mb)
                     (m, r) = collectCons cases
                     isAny (PAny Nothing ::: _) = True
-                    isAny (PAny (Just name) ::: _) = countOccurances name expr 0 == 0
+                    isAny (PAny (Just name) ::: _) = countOccurances name caseExpr 0 == 0
                     isAny _ = False
-                    expr' = IModifyRc False tv expr ::: typeof expr
                     anyMap = map isAny l
                   in
-                    (Map.insertWith insert (find n) ([(l ++ ps, expr')], anyMap) m, r)
+                    (Map.insertWith insert (find n) ([GenCase { casePats = l ++ ps, .. }], anyMap) m, r)
                 collectCons other = (Map.empty, other)
                 find = go 0 variants
                 go n ((x, _):xs) name
@@ -497,23 +582,28 @@ genMatch app env modify = gen
                 consBranches ((n, (cs, anyMap)):rest) bs = do
                   name <- block `named` fromString ("match.cons." ++ show n)
                   let types = snd $ variants !! n
+                  wordSize <- lift $ gets getWordSize
+                  let isize = LLVM.IntegerType wordSize
                   newValues <-
                     if null types then
                       return []
                     else do
                       lltypes <- lift $ sequence $ map genTy types
-                      wordSize <- lift $ gets getWordSize
-                      let ty = ptr (LLVM.StructureType False (LLVM.IntegerType wordSize : lltypes))
+                      let ty = ptr (LLVM.StructureType False (isize : lltypes))
                       castPtr <- bitcast dataPtr ty `named` fromString ("match.ptr." ++ show n)
                       buildTyped types $ buildGep castPtr
+                  decPtr <- lift $ rcPtrDestructorOf types
                   let
                     eliminate [] rest = rest
                     eliminate (True:xs) (_:ys) = eliminate xs ys
                     eliminate (_:xs) (y:ys) = y : eliminate xs ys
                     updatedValues = eliminate anyMap newValues
-                    modifyExpr [] e = e
-                    modifyExpr (v:vs) e = modifyExpr vs (IModifyRc True v e ::: typeof e)
-                    updateCase (p, e) = (eliminate anyMap p, modifyExpr updatedValues e)
+                    addMods [] m = m
+                    addMods (v:vs) m = addMods vs $ addModEntry 1 v m
+                    updateCase GenCase { .. } = GenCase
+                      { casePats = eliminate anyMap casePats,
+                        caseMod = addModDirect (-1) tv decPtr dataPtr $ addMods updatedValues caseMod,
+                        .. }
                     updatedCases = map updateCase cs
                   blocks <- gen (updatedValues ++ vs) updatedCases ok def bs
                   (branches, blocks') <- consBranches rest blocks
@@ -670,26 +760,20 @@ voidFuncTy = LLVM.FunctionType void [] False
 destructorTy :: LLVM.Type
 destructorTy = LLVM.FunctionType void [ptr i8] False
 
+modifierTy :: LLVM.Type -> LLVM.Type
+modifierTy isize = LLVM.FunctionType void [ptr isize, isize] False
+
 -- It seems like a good idea not to increment or decrement constant values;
 -- but in reality it would require more complex analysis to prove that an
 -- increment won't have an effect after the value is passed to a function.
 
 rcInc :: Int -> Operand -> Type -> Builder ()
-rcInc = rcIncDec True
-
-rcDec :: Int -> Operand -> Type -> Builder ()
-rcDec = rcIncDec False
-
-rcIncDec :: Bool -> Int -> Operand -> Type -> Builder ()
-rcIncDec isInc i o ty = go [] ty
+rcInc i o = go []
   where
-    incName
-      | isInc = "inc"
-      | otherwise = "dec"
     go l (TApp a b) = go (b:l) a
-    go [_, _] TArrow
-      | isInc = fnInc i o
-      | otherwise = fnDec i o
+    go [_, _] TArrow = do
+      dataPtr <- extractValue o [2] `named` "func.data.ptr"
+      incPtr i dataPtr
     go [] TUnit = return ()
     go [] TNat = return ()
     go [] TBool = return ()
@@ -699,7 +783,26 @@ rcIncDec isInc i o ty = go [] ty
       let tr = typeReplace typeParams l
       case variants of
         [(_, types)] ->
-          incDecAll (rcIncDec isInc i) (buildExtract o) (return ()) $ map tr types
+          incDecAll (rcInc i) (buildExtract o) (return ()) $ map tr types
+        (_:_) -> do
+          p <- extractValue o [1] `named` "rc.ptr"
+          incPtr i p
+
+rcDec :: Int -> Operand -> Type -> Builder ()
+rcDec i o = go []
+  where
+    go l (TApp a b) = go (b:l) a
+    go [_, _] TArrow = fnDec i o
+    go [] TUnit = return ()
+    go [] TNat = return ()
+    go [] TBool = return ()
+    go l (TId name) = do
+      datas <- gets datas
+      let DataDecl {..} = fromJust $ lookup name datas
+      let tr = typeReplace typeParams l
+      case variants of
+        [(_, types)] ->
+          incDecAll (rcDec i) (buildExtract o) (return ()) $ map tr types
         (_:_) -> do
           arr <- lift $ rcDataArrayOf $ map (map tr . snd) variants
           caller <- lift rcCaller
@@ -712,23 +815,31 @@ rcIncDec isInc i o ty = go [] ty
         Nothing -> do
           wordSize <- gets getWordSize
           let isize = LLVM.IntegerType wordSize
-          let arrty = ptr $ ptr $ LLVM.FunctionType void [ptr isize, isize] False
+          let arrty = ptr $ ptr $ modifierTy isize
           let
-            body [arr, o, i] = do
-              n <- extractValue o [0] `named` "rc.magic"
+            body [arr, o, i] = mdo
+              block `named` "entry"
               p <- extractValue o [1] `named` "rc.ptr"
+              isnull <- icmp ICMP.EQ p (LLVM.ConstantOperand $ C.Null (ptr i8)) `named` "rc.null"
+              condBr isnull nullBlock callBlock
+
+              callBlock <- block `named` "call"
+              n <- extractValue o [0] `named` "rc.magic"
               rcPtr <- bitcast p (ptr isize) `named` "rc.ptr.cast"
-              ptr <- gep arr [n] `named` fromString ("mod.ptr")
-              func <- load ptr 0 `named` fromString "mod"
+              modPtr <- gep arr [n] `named` "func.ptr"
+              func <- load modPtr 0 `named` "func"
               llvmFastCall func [(rcPtr, []), (i, [])]
+              retVoid
+
+              nullBlock <- block `named` "null"
               retVoid
           destructor <-
             llvmFn $ newFn
-              { fnName = "rc.call",
+              { fnName = "rc.dec",
                 fnLinkage = L.Private,
                 fnCC = CC.Fast,
                 fnRetTy = void,
-                fnParams = [(arrty, "array"), (tyVariant, "data"), (isize, "mod")],
+                fnParams = [(arrty, "array"), (tyVariant, "data"), (isize, "dec")],
                 fnBody = Just body }
           put $ s { getPtrDestructorCaller = Just destructor }
           return destructor
@@ -736,17 +847,16 @@ rcIncDec isInc i o ty = go [] ty
     rcDataArrayOf variants = do
       s <- get
       let arrays = getDataArrays s
-      let entry = (isInc, variants)
-      case Map.lookup entry arrays of
+      case Map.lookup variants arrays of
         Nothing -> mdo
-          put $ s { getDataArrays = Map.insert entry carr arrays }
+          put $ s { getDataArrays = Map.insert variants carr arrays }
           entries <- sequence $ map rcPtrDestructorOf variants
           wordSize <- gets getWordSize
           let isize = LLVM.IntegerType wordSize
-          let arrty = ptr $ LLVM.FunctionType void [ptr isize, isize] False
+          let arrty = ptr $ modifierTy isize
           arr <-
             llvmGlobal $ newGlobal
-              { globalName = "rc.array." ++ incName ++ "." ++ show (Map.size arrays),
+              { globalName = "rc.arr." ++ show (Map.size arrays),
                 globalLinkage = L.Private,
                 globalUnnamedAddress = True,
                 globalConstant = True,
@@ -755,69 +865,51 @@ rcIncDec isInc i o ty = go [] ty
           let carr = LLVM.ConstantOperand (C.GetElementPtr False arr [C.Int 32 0, C.Int 32 0])
           return carr
         Just arr -> return arr
-      where
-        rcPtrDestructorOf types' = do
-          zeroSized <- allZeroSized types'
-          s <- get
-          let isize = LLVM.IntegerType $ getWordSize s
-          if zeroSized then do
-            case getNullDestructor s of
-              Nothing -> do
-                let body [_, _] = retVoid
-                destructor <-
-                  llvmConstFn $ newFn
-                    { fnName = "rc.null",
-                      fnLinkage = L.Private,
-                      fnCC = CC.Fast,
-                      fnRetTy = void,
-                      fnParams = [(ptr isize, NoParameterName), (isize, NoParameterName)],
-                      fnBody = Just body }
-                put $ s { getNullDestructor = Just destructor }
-                return destructor
-              Just destructor -> return destructor
-          else do
-            rc <- anyRc types'
-            let destructors = getPtrDestructors s
-            let types = if rc then types' else []
-            let entry = (isInc, types)
-            case Map.lookup entry destructors of
-              Nothing -> mdo
-                put $ s { getPtrDestructors = Map.insert entry destructor destructors }
-                let
-                  body [rcPtr, i] = do
-                    block `named` "entry"
-                    rcval <- load rcPtr 0 `named` "rc"
-                    if isInc then do
-                      newRc <- addNUW rcval i `named` "new.rc"
-                      store rcPtr 0 newRc
-                      retVoid
-                    else mdo
-                      newRc <- subNUW rcval i `named` "new.rc"
-                      zero <- icmp ICMP.EQ newRc (lcint 32 0) `named` "zero"
-                      condBr zero destroy keep
 
-                      destroy <- block `named` "destroy"
-                      let free = callFree rcPtr
-                      if rc then do
-                        ts <- lift $ sequence $ map genTy types
-                        o <- bitcast rcPtr (ptr $ LLVM.StructureType False (isize : ts)) `named` "ptr.cast"
-                        incDecAll (rcDec 1) (buildGep o) free types
-                      else free
-                      retVoid
+rcPtrDestructorOf :: [Type] -> BuilderState C.Constant
+rcPtrDestructorOf types' = do
+  zeroSized <- allZeroSized types'
+  s <- get
+  let isize = LLVM.IntegerType $ getWordSize s
+  if zeroSized then
+    return $ C.Null $ ptr $ modifierTy isize
+  else do
+    rc <- anyRc types'
+    let destructors = getPtrDestructors s
+    let types = if rc then types' else []
+    case Map.lookup types destructors of
+      Nothing -> mdo
+        put $ s { getPtrDestructors = Map.insert types destructor destructors }
+        let
+          body [rcPtr, i] = mdo
+            block `named` "entry"
+            rcval <- load rcPtr 0 `named` "rc"
+            newRc <- subNUW rcval i `named` "new.rc"
+            zero <- icmp ICMP.EQ newRc (lcint 32 0) `named` "zero"
+            condBr zero destroy keep
 
-                      keep <- block `named` "keep"
-                      store rcPtr 0 newRc
-                      retVoid
-                destructor <-
-                  llvmConstFn $ newFn
-                    { fnName = "rc." ++ incName ++ "." ++ show (Map.size destructors) ++ ".",
-                      fnLinkage = L.Private,
-                      fnCC = CC.Fast,
-                      fnRetTy = void,
-                      fnParams = [(ptr isize, ParameterName "rc.ptr"), (isize, ParameterName "mod")],
-                      fnBody = Just body }
-                return destructor
-              Just destructor -> return destructor
+            destroy <- block `named` "destroy"
+            let free = callFree rcPtr
+            if rc then do
+              ts <- lift $ sequence $ map genTy types
+              o <- bitcast rcPtr (ptr $ LLVM.StructureType False (isize : ts)) `named` "ptr.cast"
+              incDecAll (rcDec 1) (buildGep o) free types
+            else free
+            retVoid
+
+            keep <- block `named` "keep"
+            store rcPtr 0 newRc
+            retVoid
+        destructor <-
+          llvmConstFn $ newFn
+            { fnName = "rc." ++ show (Map.size destructors) ++ ".",
+              fnLinkage = L.Private,
+              fnCC = CC.Fast,
+              fnRetTy = void,
+              fnParams = [(ptr isize, ParameterName "rc.ptr"), (isize, ParameterName "mod")],
+              fnBody = Just body }
+        return destructor
+      Just destructor -> return destructor
 
 incDecAll :: (Operand -> Type -> Builder ())
           -> (Integer -> Builder Operand)
@@ -856,34 +948,33 @@ buildTyped types f = go 0 types
       r <- go (n+1) ts
       return ((v ::: t) : r)
 
-fnInc :: Int -> Operand -> Builder ()
-fnInc i closure = do
+incPtr :: Int -> Operand -> Builder ()
+incPtr i dataPtr = do
   s <- lift get
   let wordSize = getWordSize s
-  incrementer <- case getFnInc s of
+  incrementer <- case getInc s of
     Nothing -> do
       incrementer <-
         lift $ llvmFn $ newFn
-          { fnName = "fn.inc",
+          { fnName = "rc.inc",
             fnLinkage = L.Private,
             fnCC = CC.Fast,
             fnRetTy = void,
-            fnParams = [(funcTy, ParameterName "closure"), (LLVM.IntegerType wordSize, ParameterName "inc")],
+            fnParams = [(ptr i8, ParameterName "ptr"), (LLVM.IntegerType wordSize, ParameterName "inc")],
             fnBody = Just body }
-      lift $ modify $ \s -> s { getFnInc = Just incrementer }
+      lift $ modify $ \s -> s { getInc = Just incrementer }
       return incrementer
     Just incrementer -> return incrementer
-  llvmFastCall incrementer [(closure, []), (lcint wordSize $ toInteger i, [])]
+  llvmFastCall incrementer [(dataPtr, []), (lcint wordSize $ toInteger i, [])]
   return ()
   where
     body :: [Operand] -> Builder ()
-    body [closure, inc] = mdo
+    body [dataPtr, inc] = mdo
       block `named` "entry"
-      dataPtr <- extractValue closure [2] `named` "data.ptr"
       isnull <- icmp ICMP.EQ dataPtr (LLVM.ConstantOperand $ C.Null (ptr i8)) `named` "isnull"
-      condBr isnull done nonnull
+      condBr isnull nullBlock incBlock
 
-      nonnull <- block `named` "nonnull"
+      incBlock <- block `named` "inc"
       wordSize <- lift $ gets getWordSize
       rcPtr <- bitcast dataPtr (ptr $ LLVM.IntegerType wordSize) `named` "rc.ptr"
       rc <- load rcPtr 0 `named` "rc"
@@ -891,7 +982,7 @@ fnInc i closure = do
       store rcPtr 0 newRc
       retVoid
 
-      done <- block `named` "done"
+      nullBlock <- block `named` "null"
       retVoid
 
 fnDec :: Int -> Operand -> Builder ()

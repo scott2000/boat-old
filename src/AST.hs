@@ -8,12 +8,6 @@ import Data.List
 import Control.Monad.State
 import qualified Data.Set as Set
 
-import LLVM.AST (Operand)
-
-import LLVM.Pretty
-
-import Data.Text.Lazy (unpack)
-
 type MatchCase = ([Typed Pattern], Typed Expr)
 
 data Expr
@@ -26,8 +20,6 @@ data Expr
   | Match [Typed Expr] [MatchCase]              -- (match a in b c)
   | Panic String                                -- panic
   | ICons Name Name [Typed Expr]
-  | ILift Operand
-  | IModifyRc Bool (Typed Operand) (Typed Expr)
   deriving Eq
 
 data Type
@@ -87,10 +79,6 @@ instance Show Expr where
   show (Panic msg) = "(panic " ++ msg ++ "\n)"
   show (ICons _ variant []) = show variant
   show (ICons _ variant list) = "(" ++ intercalate " " (show variant : map show list) ++ ")"
-  show (ILift o) = "{- LIFT " ++ unpack (ppll o) ++ " -}"
-  show (IModifyRc isInc (o ::: ty) expr) =
-    "{- RC " ++ (if isInc then "INC" else "DEC")
-    ++ " " ++ unpack (ppll o) ++ " : " ++ show ty ++ " -} " ++ show expr
 
 showCase :: MatchCase -> String
 showCase (p, e) = "  " ++ intercalate " " (map show p) ++ " -> " ++ show e
@@ -252,8 +240,6 @@ countLocals (expr ::: _) env =
     Panic _ -> env
     ICons _ _ list ->
       foldr ($) env $ map countLocals list
-    ILift _ -> env
-    IModifyRc _ _ expr -> countLocals expr env
   where
     addName name [] = []
     addName name ((e@(n, x)) : xs)
@@ -299,8 +285,6 @@ countOccurances name = go
         Panic _ -> x
         ICons _ _ list ->
           foldr ($) x $ map go list
-        ILift _ -> x
-        IModifyRc _ _ expr -> go expr x
 
 substitute :: Name -> Expr -> Typed Expr -> Typed Expr
 substitute name value (expr ::: ty) =
@@ -329,8 +313,6 @@ substitute name value (expr ::: ty) =
     Panic msg -> Panic msg
     ICons n variant list ->
       ICons n variant $ for list $ substitute name value
-    ILift o -> ILift o
-    IModifyRc isInc o expr -> IModifyRc isInc o expr
 
 checkFunc :: [Typed Name] -> Name -> Expr -> Typed Expr -> Typed Expr
 checkFunc [] name value expr = substitute name value expr
