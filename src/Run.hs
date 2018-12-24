@@ -1,12 +1,11 @@
 {-# LANGUAGE RecordWildCards #-}
 
-module Run (getInstanceOfValue, evaluateAll, evaluate, embed) where
+module Run (getInstanceOfValue, evaluateAll, embed) where
 
 import AST
 import Infer (TypeMap (mapTypes))
 
 import Data.Maybe
-import Data.List
 import Control.Monad.State
 import qualified Data.Map as Map
 
@@ -53,9 +52,6 @@ evaluateAll valDecls dataDecls =
         _ -> run expr
       rest <- helper xs
       return ((name, v) : rest)
-
-evaluate :: Env (Typed Value) -> Typed Expr -> Either String (Typed Value)
-evaluate = error "unimplemented"
 
 getValue :: Name -> RunState (Typed Value)
 getValue name = do
@@ -112,7 +108,6 @@ funApp (f ::: fty) (x ::: _) =
           lift $ Left ("application to non-function type: " ++ show fty)
 
 runCases :: [MatchCase] -> [Typed Value] -> RunState (Typed Value)
-runCases [] vs = lift $ Left ("no pattern matches for values: " ++ intercalate " " (map show vs))
 runCases ((ps, expr):cs) vs =
   case tryAllPatterns ps vs expr of
     Just expr -> run expr
@@ -140,7 +135,6 @@ tryPattern p v expr =
     (PCons n0 l0, Cons _ n1 l1)
       | n0 == n1 -> tryAllPatterns l0 l1 expr
       | otherwise -> Nothing
-    _ -> error ("impossible pattern and value: " ++ show p ++ " = " ++ show v)
 
 embed :: Typed Value -> Typed Expr
 embed (v ::: t) = Val v ::: t

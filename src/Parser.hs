@@ -60,18 +60,19 @@ valDeclParser = label "value declaration" $ do
   ty <- parseAscription
   symbol $ string "="
   expr <- parser
-  return (name, ascribe expr ty)
+  (,) name <$> ascribe expr ty
 
 dataDeclParser :: Parser (Name, DataDecl)
 dataDeclParser = label "data declaration" $ do
   try $ symbol $ key "data"
   (name, typeParams) <- variant
+  tp <- sequence $ map into typeParams
   symbol $ string "="
   variants <- multiline <|> singleline
-  return (name, DataDecl { typeParams = map into typeParams, variants })
+  return (name, DataDecl { typeParams = tp, variants })
   where
-    into (TVar s) = s
-    into other = error ("data declaration expected type variables, found other type: " ++ show other)
+    into (TVar s) = return s
+    into other = fail ("data declaration expected type variables, found other type: " ++ show other)
     multiline = do
       try $ symbol $ string "|"
       singleline
@@ -103,7 +104,7 @@ instance Parsable (Typed Expr) where
     <|> try (symbol $ key "unit" >> return (Val Unit ::: TUnit))
     <|> try (symbol $ key "true" >> return (Val (Bool True) ::: TBool))
     <|> try (symbol $ key "false" >> return (Val (Bool False) ::: TBool))
-    <|> (::: TNat) <$> Val <$> Nat <$> number
+    <|> (::: TNat) <$> Val <$> Nat <$> try number
 
   parsedOp "->" _ _ = fail ("cannot use (->) operator in expression")
   parsedOp op a b = typed $ return $ Op op a b
@@ -113,7 +114,7 @@ instance Parsable (Typed Expr) where
 instance Parsable Type where
   parsePartial = label "type" $ try paren
     <|> try (tIdVar <$> identifier)
-    <|> (symbol $ key "_" >> newType)
+    <|> try (symbol $ key "_" >> newType)
 
   parsedOp "->" a b = return $ TFunc a b
   parsedOp op _ _ = fail ("cannot use (" ++ op ++ ") operator in type")
@@ -127,7 +128,7 @@ instance Parsable (Typed Pattern) where
     <|> try (symbol $ key "unit" >> return (PAny Nothing ::: TUnit))
     <|> try (symbol $ key "true" >> return (PBool True ::: TBool))
     <|> try (symbol $ key "false" >> return (PBool False ::: TBool))
-    <|> (::: TNat) <$> PNat <$> number
+    <|> (::: TNat) <$> PNat <$> try number
 
   parsedOp op _ _ = fail ("cannot use (" ++ op ++ ") operator in pattern")
 
@@ -139,23 +140,22 @@ parserPrec = parserBase parsePartial
   where
   parserBase base prec = do
     expr <- base
-    try (opExpr expr) <|> try (appExpr expr) <|> return expr
+    res <- try (opExpr expr) <|> try (appExpr expr) <|> return (Right expr)
+    case res of
+      Left err -> fail err
+      Right expr -> return expr
     where
       opExpr expr = do
-        (op, kind) <- operatorInContext
+        (op, kind) <- try operatorInContext
         if isInfix kind then
           let newPrec = adjustPrec kind $ precedence op in
-          case precError prec newPrec of
-            Just err -> fail err
-            Nothing -> do
-              other <- parserPrec newPrec
-              parserBase (parsedOp op expr other) prec
+          tryPrec prec newPrec $ do
+            other <- parserPrec newPrec
+            parserBase (parsedOp op expr other) prec
         else
-          error ("cannot use operator (" ++ op ++ ") of kind " ++ show kind ++ " here")
+          return $ Left ("cannot use operator (" ++ op ++ ") of kind " ++ show kind ++ " here")
       appExpr expr =
-        case precError prec appPrec of
-          Just err -> fail err
-          Nothing -> do
+        tryPrec prec appPrec $ do
             other <- parserPrec appPrec
             parserBase (parsedApp expr other) prec
 
@@ -226,7 +226,7 @@ function = do
     caseFunction cases = do
       sequence_ $ for tailed $ \(pats, _) ->
         if length pats /= len then
-          error "different number of patterns in function cases"
+          fail "different number of patterns in function cases"
         else
           return ()
       return $ Val $ Func (mapTy idents) $ Match (mapTy $ map Id idents) cases ::: t0
@@ -246,7 +246,7 @@ letbinding = do
     val <- parser
     symbol $ key "in"
     return (name, val)
-  expr <- parser
+  expr <- blockOf parser
   return $ Let name val expr
 
 matchbinding :: Parser Expr
@@ -261,7 +261,7 @@ matchbinding = do
       if length pats == len then
         return (pats, expr)
       else
-        error "different number of patterns and expressions in match"
+        fail "different number of patterns and expressions in match"
     someExprs = do
       e <- symbol $ parserNoSpace
       (e:) <$> manyExprs
@@ -340,7 +340,7 @@ identifier :: Parser String
 identifier = label "identifier" $ symbol $ do
   ident <- word
   if ident `elem` keywords then
-    fail ("expected an identifier, found keyword `" ++ ident ++ "`")
+    fail "expected identifier"
   else
     return ident
 
@@ -351,19 +351,22 @@ typed :: Parser a -> Parser (Typed a)
 typed p = (:::) <$> p <*> newType
 
 maybeRetype :: Parser (Typed a) -> Parser (Typed a)
-maybeRetype p = ascribe <$> p <*> parseAscription
+maybeRetype p = do
+  v <- p
+  a <- parseAscription
+  ascribe v a
 
 parseAscription :: Parser (Maybe Type)
 parseAscription = (<|> return Nothing) $ do
   try $ symbol $ char ':'
   Just <$> parser
 
-ascribe :: Typed a -> (Maybe Type) -> Typed a
+ascribe :: Typed a -> (Maybe Type) -> Parser (Typed a)
 ascribe (x ::: old) (Just new) =
   case earlyUnify old new of
-    Just ty -> (x ::: ty)
-    Nothing -> error ("cannot ascribe type " ++ show new ++ " to expression of type " ++ show old)
-ascribe expr Nothing = expr
+    Just ty -> return (x ::: ty)
+    Nothing -> fail ("cannot ascribe type " ++ show new ++ " to expression of type " ++ show old)
+ascribe expr Nothing = return expr
 
 earlyUnify :: Type -> Type -> Maybe Type
 earlyUnify (TAnon _) t = Just t
@@ -384,7 +387,7 @@ key :: String -> Parser ()
 key w = label w $ do
   ident <- word
   if ident /= w then
-    fail ("expected keyword `" ++ w ++ "`, found `" ++ ident ++ "`")
+    fail ("expected keyword `" ++ w ++ "`")
   else if not (w `elem` keywords) then
     error ("not a keyword: " ++ w)
   else
@@ -435,19 +438,19 @@ appPrec = (10, ALeft)
 maxPrec :: (Prec, Assoc)
 maxPrec = (21, ANon)
 
-precError :: (Prec, Assoc) -> (Prec, Assoc) -> Maybe String
-precError (p0, a0) (p1, a1)
+tryPrec :: (Prec, Assoc) -> (Prec, Assoc) -> Parser a -> Parser (Either String a)
+tryPrec (p0, a0) (p1, a1) m
   | p0 == p1 =
     if a0 /= a1 then
-      error ("cannot mix associativities of operators in same precedence level (" ++ show p0 ++ ")")
+      return $ Left ("cannot mix associativities of operators in same precedence level (" ++ show p0 ++ ")")
     else if a0 == ALeft then
-      Just "left-assoc"
+      empty
     else if a0 == ANon then
-      error "non-associative operator chaining not allowed"
+      return $ Left "non-associative operator chaining not allowed"
     else
-      Nothing
-  | p0 > p1 = Just "high-prec"
-  | otherwise = Nothing
+      Right <$> m
+  | p0 > p1 = empty
+  | otherwise = Right <$> m
 
 
 adjustPrec :: OpKind -> (Prec, Assoc) -> (Prec, Assoc)

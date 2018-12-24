@@ -47,7 +47,7 @@ Current Goals:
 - verification of data types
 - better multiline repl support
 - add `rec` keyword for tail recursion
-- better error handling (especially in parser)
+- better error handling
 - char, int, float types
 - string, list, tuple syntactic sugar
 - compile-time simplification (with gas limit)

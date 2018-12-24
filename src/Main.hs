@@ -258,7 +258,7 @@ iterRepl string = do
       return state
 
 parseRepl :: Word64 -> Parser ReplResult
-parseRepl n = try (DeclareVal <$> parseReplVal n) <|> try (DeclareData <$> dataDeclParser) <|> (Eval <$> parseReplExpr n)
+parseRepl n = DeclareVal <$> parseReplVal n <|> DeclareData <$> dataDeclParser <|> Eval <$> parseReplExpr n
 
 parseReplVal :: Word64 -> Parser (Name, Typed Expr)
 parseReplVal 0 = valDeclParser
