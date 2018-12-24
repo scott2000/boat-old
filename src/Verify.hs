@@ -11,6 +11,7 @@ import Data.Maybe
 data VPattern
   = VAny
   | VCons Name [VPattern]
+  deriving (Eq, Ord)
 
 instance Show VPattern where
   show VAny = "_"
@@ -41,12 +42,13 @@ verifyExpr datas = ver
           sequence_ $ map ver xs
           let defs = defaultVPats $ length xs
           result <-
-            iter cases [defs] $ \(pats, expr) vs ->
-              if null vs then
+            iter cases [defs] $ \(pats, expr) vs -> do
+              ver expr
+              let vs' = concat $ map (go pats) vs
+              if vs' == vs then
                 Left ("unreachable pattern: " ++ intercalate " " (map show pats))
-              else do
-                ver expr
-                Right $ concat $ map (go pats) vs
+              else
+                Right vs'
           if null result then
             Right ()
           else
