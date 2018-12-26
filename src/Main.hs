@@ -184,7 +184,7 @@ repl = go ""
                     repl
                   Eval expr -> do
                     ReplState {..} <- get
-                    let newDecls = changeValDecl (Name replRes, expr) replDecls
+                    let newDecls = changeValDecl (Name [replRes], expr) replDecls
                     case inferAll replNextAnon newDecls of
                       Left err -> outputError err
                       Right (inferred, newAnon) ->
@@ -192,7 +192,7 @@ repl = go ""
                           Left err -> outputError err
                           Right evaluated -> do
                             let
-                              outputExpr = fromJust $ lookup (Name replRes) evaluated
+                              outputExpr = fromJust $ lookup (Name [replRes]) evaluated
                               typeInfo str
                                 | replSetInfo = str ++ dullBlue ++ " : "
                                                 ++ show (typeof outputExpr) ++ reset
@@ -271,7 +271,7 @@ parseReplExpr 0 = parser
 parseReplExpr n = substituteN n <$> parser
 
 substituteN :: Word64 -> Typed Expr -> Typed Expr
-substituteN n = substitute (Name "res") $ Id $ Name ("res" ++ show (n-1))
+substituteN n = substitute (Name ["res"]) $ Id $ Name ["res" ++ show (n-1)]
 
 parseCommands :: String -> Repl ReplResult
 parseCommands commands =

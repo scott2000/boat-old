@@ -60,8 +60,8 @@ data DataDecl = DataDecl
     variants :: Env [Type] }
   deriving Eq
 
-newtype Name
-  = Name String
+newtype Name = Name
+  { unname :: [String] }
   deriving (Eq, Ord)
 
 --TODO replace most usages of Env with Map for efficiency?
@@ -113,7 +113,7 @@ instance Show Pattern where
   show (PCons n pats) = "(" ++ intercalate " " (show n : map show pats) ++ ")"
 
 instance Show Name where
-  show (Name s) = s
+  show (Name s) = intercalate "." s
 
 emptyDecls :: Decls
 emptyDecls = Decls
@@ -152,7 +152,7 @@ constructorsForData (name, DataDecl {..}) = map constructorFor variants
         fty = mkFuncTy types ty
     ty = foldl' TApp (TId name) tvars
     tvars = map TVar typeParams
-    allNames = for [0..] $ \x -> Name $ "p" ++ show x
+    allNames = for [0..] $ \x -> Name ["p" ++ show x]
 
 constructorTypesForData :: (Name, DataDecl) -> Env Type
 constructorTypesForData (name, DataDecl {..}) = map typeFor variants
@@ -370,33 +370,36 @@ mkFuncTy :: [Type] -> Type -> Type
 mkFuncTy [] r = r
 mkFuncTy (x:xs) r = TFunc x (mkFuncTy xs r)
 
-tIdVar :: String -> Type
-tIdVar [] = error "type name cannot be empty"
-tIdVar s =
+tIdVar :: Name -> Type
+tIdVar (name@(Name [s])) =
   if head s `elem` ['A'..'Z'] then
-    TId (Name s)
+    TId name
   else
     TVar s
+tIdVar name = TId name
 
-pIdVar :: String -> Pattern
-pIdVar [] = error "pattern name cannot be empty"
-pIdVar s =
+pIdVar :: Name -> Pattern
+pIdVar (name@(Name [s])) =
   if head s `elem` ['A'..'Z'] then
-    PCons (Name s) []
+    PCons name []
   else
-    PAny $ Just $ Name s
+    PAny $ Just $ name
+pIdVar name = PCons name []
 
 for :: [a] -> (a -> b) -> [b]
 for = flip map
 
+pattern Internal :: String -> Name
+pattern Internal s = Name [{- "internal", -}s]
+
 pattern TUnit :: Type
-pattern TUnit = TId (Name "Unit")
+pattern TUnit = TId (Internal "Unit")
 
 pattern TNat :: Type
-pattern TNat = TId (Name "Nat")
+pattern TNat = TId (Internal "Nat")
 
 pattern TBool :: Type
-pattern TBool = TId (Name "Bool")
+pattern TBool = TId (Internal "Bool")
 
 pattern TFunc :: Type -> Type -> Type
 pattern TFunc a b = TApp (TApp TArrow a) b

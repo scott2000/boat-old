@@ -113,7 +113,7 @@ instance Parsable (Typed Expr) where
 
 instance Parsable Type where
   parsePartial = label "type" $ try paren
-    <|> try (tIdVar <$> identifier)
+    <|> try (tIdVar <$> name)
     <|> try (symbol $ key "_" >> newType)
 
   parsedOp "->" a b = return $ TFunc a b
@@ -123,7 +123,7 @@ instance Parsable Type where
 
 instance Parsable (Typed Pattern) where
   parsePartial = label "pattern" $ maybeRetype $ paren
-    <|> try (typed (pIdVar <$> identifier))
+    <|> try (typed (pIdVar <$> name))
     <|> try (symbol $ key "_" >> typed (return $ PAny Nothing))
     <|> try (symbol $ key "unit" >> return (PAny Nothing ::: TUnit))
     <|> try (symbol $ key "true" >> return (PBool True ::: TBool))
@@ -235,7 +235,7 @@ function = do
         len = length p0
         types = map typeof p0
         mapTy xs = zipWith (:::) xs types
-        idents = for [0..len-1] $ \n -> Name $ "{-" ++ show n ++ "-}"
+        idents = for [0..len-1] $ \n -> Name ["{-" ++ show n ++ "-}"]
 
 letbinding :: Parser Expr
 letbinding = do
@@ -345,7 +345,7 @@ identifier = label "identifier" $ symbol $ do
     return ident
 
 name :: Parser Name
-name = Name <$> identifier
+name = Name <$> ((:) <$> identifier <*> (many (try (char '.') >> identifier)))
 
 typed :: Parser a -> Parser (Typed a)
 typed p = (:::) <$> p <*> newType

@@ -150,7 +150,7 @@ inLet builder namef = do
 
 compile :: String -> Env (Typed Value) -> Env DataDecl -> Word32 -> IO ()
 compile path env datas wordSize =
-  case lookup (Name "main") env of
+  case lookup (Name ["main"]) env of
     Nothing -> putStrLn "no `main` value found"
     Just main
       | notConcrete (typeof main) ->
@@ -1118,7 +1118,7 @@ buildStaticClosure free params expr = mdo
     len = length anons
     paramType (Name name ::: ty) = do
       gen <- genTy ty
-      return (gen, fromString name)
+      return (gen, fromString $ show name)
     nameBase = currentValue ++ "." ++ show len ++ "."
   put (codegen { anonymousFunctions = result : anons })
   funcParams <- sequence $ map paramType combinedArgs
