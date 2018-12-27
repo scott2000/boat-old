@@ -45,10 +45,11 @@ Current Goals:
 
 - printing of output when compiled
 - verification of data types
-- better multiline repl support
+- name clash resolution
 - add `rec` keyword for tail recursion
 - better error handling
 - char, int, float types
+- nat and bool pattern verification (or add normal constructors and patterns with syntactic sugar)
 - string, list, tuple syntactic sugar
 - compile-time simplification (with gas limit)
 - prefix and suffix operators (use ~ for negation?)

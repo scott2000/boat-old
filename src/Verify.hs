@@ -57,6 +57,8 @@ verifyExpr datas = ver
         _ -> Right ()
     enumerate :: Type -> [(Name, [VPattern])]
     enumerate (TApp a _) = enumerate a
+    enumerate TNat = [(Name ["0"], []), (Name ["1 +"], [VAny])]
+    enumerate TBool = [(Name ["false"], []), (Name ["true"], [])]
     enumerate (TId name) =
       let DataDecl {..} = fromJust $ lookup name datas in
       for variants $ \
@@ -64,6 +66,10 @@ verifyExpr datas = ver
     go :: [Typed Pattern] -> [VPattern] -> [[VPattern]]
     go [] [] = []
     go ((PAny _ ::: _) : ps) (v:vs) = map (v:) $ go ps vs
+    go ((PNat 0 ::: t) : ps) vs = go (((PCons (Name ["0"]) []) ::: t) : ps) vs
+    go ((PNat n ::: t) : ps) vs = go (((PCons (Name ["1 +"]) [PNat (n-1) ::: t]) ::: t) : ps) vs
+    go ((PBool False ::: t) : ps) vs = go (((PCons (Name ["false"]) []) ::: t) : ps) vs
+    go ((PBool True ::: t) : ps) vs = go (((PCons (Name ["true"]) []) ::: t) : ps) vs
     go ((PCons n xs ::: ty) : ps) (v:vs) =
       case v of
         VAny -> concat $ map try $ enumerate ty
