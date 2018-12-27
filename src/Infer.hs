@@ -371,14 +371,14 @@ ty glob env (x ::: fin) = do
       unify fin $ mkFuncTy (map typeof xs) res
     Id name -> do
       ty <-
-        case Map.lookup name (globalVariables glob) of
-          Just ty -> alias globalAlias ty
+        case lookup name env of
+          Just ty -> return ty
           Nothing ->
-            case Map.lookup name (inferenceVariables glob) of
-              Just ty -> alias inferAlias ty
+            case Map.lookup name (globalVariables glob) of
+              Just ty -> alias globalAlias ty
               Nothing ->
-                case lookup name env of
-                  Just ty -> return ty
+                case Map.lookup name (inferenceVariables glob) of
+                  Just ty -> alias inferAlias ty
                   Nothing -> lift $ Left ("cannot find value: `" ++ show name ++ "`")
       unify fin ty
     Op op a b -> do

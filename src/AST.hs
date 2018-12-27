@@ -115,6 +115,12 @@ instance Show Pattern where
 instance Show Name where
   show (Name s) = intercalate "." s
 
+isGeneric :: Type -> Bool
+isGeneric (TId _) = False
+isGeneric TArrow = False
+isGeneric (TApp a b) = isGeneric a || isGeneric b
+isGeneric _ = True
+
 emptyDecls :: Decls
 emptyDecls = Decls
   { valDecls = [],
@@ -139,12 +145,12 @@ showDataDecl (name, DataDecl {..}) =
     parameterized = intercalate " " (show name : typeParams)
     showVariant (name, types) = intercalate " " (show name : map show types)
 
-constructorsForData :: (Name, DataDecl) -> Env (Typed Value)
+constructorsForData :: (Name, DataDecl) -> Env (Typed Expr)
 constructorsForData (name, DataDecl {..}) = map constructorFor variants
   where
-    constructorFor (vname, []) = (vname, Cons name vname [] ::: ty)
+    constructorFor (vname, []) = (vname, Val (Cons name vname []) ::: ty)
     constructorFor (vname, types) =
-      (vname, (Func names $ ICons name vname exprs ::: ty) ::: fty)
+      (vname, (Val $ Func names $ ICons name vname exprs ::: ty) ::: fty)
       where
         names = zipWith (:::) allNames types
         exprs = zipWith idFor allNames types

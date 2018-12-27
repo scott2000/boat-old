@@ -17,7 +17,6 @@ import System.IO (hFlush, stdout, readFile)
 import System.Exit (exitFailure)
 import System.Environment (getArgs)
 import Data.Word
-import Data.Maybe
 import Text.Megaparsec
 import Control.Monad.State
 
@@ -34,6 +33,14 @@ main = do
       putStrLn ("too many arguments: " ++ unwords other)
       putStrLn "expected either a file name or nothing"
 
+findNamed :: Name -> Env (Typed a) -> Either String (Typed Name)
+findNamed name env =
+  case lookup name env of
+    Nothing -> Left ("cannot find a definition for `" ++ show name ++ "`")
+    Just (_ ::: ty)
+      | isGeneric ty -> Left ("type of entry point `" ++ show name ++ "` is not concrete: " ++ show ty)
+      | otherwise -> Right (name ::: ty)
+
 startCompile :: String -> IO ()
 startCompile path = do
   header path
@@ -49,17 +56,21 @@ startCompile path = do
       putStr $ unlines $ map showValDecl $ valDecls decls
       header "inferred"
       case inferAll nextAnon decls of
-        Left err -> putStrLn (errorFmt ++ "error: " ++ reset ++ err) >> exitFailure
+        Left err -> printerr err
         Right (inferred, _) -> do
           putStr $ unlines $ map showValDecl inferred
           header "evaluate"
-          case evaluateAll inferred datas of
-            Left err -> putStrLn (errorFmt ++ "error: " ++ reset ++ err) >> exitFailure
-            Right evaluated -> do
-              putStr $ unlines $ map (\(n,x) -> show n ++ " : " ++ show (typeof x) ++ " = " ++ show x) evaluated
-              header "compiled"
-              compile path evaluated datas 64
+          case findNamed (Name ["main"]) inferred of
+            Left err -> printerr err
+            Right name ->
+              case evaluateEntry name inferred datas of
+                Left err -> printerr err
+                Right (mainVal, runMap) -> do
+                  putStrLn (show mainVal ++ " : " ++ show (typeof mainVal))
+                  header "compiled"
+                  compile path mainVal runMap datas 64
   where
+    printerr err = putStrLn (errorFmt ++ "error: " ++ reset ++ err) >> exitFailure
     header x = putStrLn ("\n-- " ++ x ++ " --\n")
 
 type Repl = StateT ReplState (InputT IO)
@@ -184,29 +195,32 @@ repl = go ""
                     repl
                   Eval expr -> do
                     ReplState {..} <- get
-                    let newDecls = changeValDecl (Name [replRes], expr) replDecls
+                    let
+                      resName = Name [replRes]
+                      newDecls = changeValDecl (resName, expr) replDecls
                     case inferAll replNextAnon newDecls of
                       Left err -> outputError err
                       Right (inferred, newAnon) ->
-                        case evaluateAll inferred $ dataDecls newDecls of
+                        case findNamed resName inferred of
                           Left err -> outputError err
-                          Right evaluated -> do
-                            let
-                              outputExpr = fromJust $ lookup (Name [replRes]) evaluated
-                              typeInfo str
-                                | replSetInfo = str ++ dullBlue ++ " : "
-                                                ++ show (typeof outputExpr) ++ reset
-                                | otherwise   = str
-                              output = typeInfo $ show outputExpr
-                              toExprs (x, y ::: t) = (x, Val y ::: t)
-                            lift $ outputStrLn output
-                            put $ ReplState
-                              { replNextAnon = newAnon,
-                                replNextExpr = replNextExpr+1,
-                                replDecls = replDecls { valDecls = map toExprs evaluated },
-                                replFirst = True,
-                                .. }
-                            repl
+                          Right typedName ->
+                            case evaluateEntry typedName inferred $ dataDecls newDecls of
+                              Left err -> outputError err
+                              Right (evaluated, _) -> do
+                                let
+                                  typeInfo str
+                                    | replSetInfo = str ++ dullBlue ++ " : "
+                                                    ++ show (typeof evaluated) ++ reset
+                                    | otherwise   = str
+                                  output = typeInfo $ show evaluated
+                                lift $ outputStrLn output
+                                put $ ReplState
+                                  { replNextAnon = newAnon,
+                                    replNextExpr = replNextExpr+1,
+                                    replDecls = replDecls { valDecls = inferred },
+                                    replFirst = True,
+                                    .. }
+                                repl
 
 unfinished :: String -> Maybe Char
 unfinished str = foldl (<|>) Nothing $ map check [('(', ')'), ('[', ']'), ('{', '}')]

@@ -5,7 +5,7 @@
 module Compile (compile) where
 
 import AST
-import Run (getInstanceOfValue)
+import Run
 
 import qualified LLVM.AST as LLVM
 import qualified LLVM.AST.Typed as LLVM
@@ -31,7 +31,6 @@ import LLVM.PassManager (PassSetSpec (..), defaultCuratedPassSetSpec, withPassMa
 
 import LLVM.Pretty
 
-import System.Exit (exitFailure)
 import Data.Word
 import Data.Maybe
 import Data.List
@@ -44,6 +43,7 @@ import qualified Data.Map as Map
 
 Current Goals:
 
+- printing of output when compiled
 - verification of data types
 - better multiline repl support
 - add `rec` keyword for tail recursion
@@ -78,7 +78,7 @@ type FunctionEntry = (LLVM.Type, Maybe LLVM.Type) -- arg, (Just = NF ret, Nothin
 
 data Codegen = Codegen
   { anonymousFunctions :: [ClosureData],
-    values :: Env (Typed Value),
+    getRunMap :: RunMap,
     datas :: Env DataDecl,
     getWordSize :: !Word32,
     getDestructors :: Map.Map DestructorEntry C.Constant,
@@ -110,10 +110,10 @@ data ClosureData = ClosureData
 type BuilderState = StateT Codegen ModuleBuilder
 type Builder = IRBuilderT BuilderState
 
-newCodegen :: Env (Typed Value) -> Env DataDecl -> Word32 -> Codegen
-newCodegen values datas wordSize = Codegen
+newCodegen :: RunMap -> Env DataDecl -> Word32 -> Codegen
+newCodegen runMap datas wordSize = Codegen
   { anonymousFunctions = [],
-    values = concat (map constructorsForData datas) ++ values,
+    getRunMap = runMap,
     datas = datas,
     getWordSize = wordSize,
     getDestructors = Map.empty,
@@ -134,7 +134,7 @@ newCodegen values datas wordSize = Codegen
     getFunctionName = "main" }
 
 allValues :: BuilderState [Name]
-allValues = (map fst) <$> (gets values)
+allValues = Map.keys <$> gets getRunMap
 
 inVal :: Builder a -> String -> Builder a
 inVal builder name' = inLet builder (const name')
@@ -148,46 +148,35 @@ inLet builder namef = do
   modify $ \s -> s { getFunctionName = name }
   return r
 
-compile :: String -> Env (Typed Value) -> Env DataDecl -> Word32 -> IO ()
-compile path env datas wordSize =
-  case lookup (Name ["main"]) env of
-    Nothing -> putStrLn "no `main` value found"
-    Just main
-      | notConcrete (typeof main) ->
-        putStrLn ("`main` value has generic type: " ++ show (typeof main)) >> exitFailure
-      | otherwise -> do
-        let
-          m = buildModule "test"
-            $ evalStateT (genMain main)
-            $ newCodegen env datas wordSize
-          ofile = File (replaceExtension "o" path)
-        putStrLn $ unpack $ ppllvm m
-        withContext $ \c ->
-          withModuleFromAST c m $ \cm ->
-            withHostTargetMachine $ \tm -> do
-              layout <- getTargetMachineDataLayout tm
-              let
-                spec = defaultCuratedPassSetSpec
-                  { optLevel = Just (if debugMode then 0 else 1),
-                    dataLayout = Just layout,
-                    targetMachine = Just tm }
-              withPassManager spec $ \pm -> runPassManager pm cm
-              writeObjectToFile tm ofile cm
-              mm <- moduleAST cm
-              writeFile (replaceExtension "ll" path) $ unpack $ ppllvm mm
-  where
-    notConcrete (TId _) = False
-    notConcrete TArrow = False
-    notConcrete (TApp a b) = notConcrete a || notConcrete b
-    notConcrete _ = True
+compile :: String -> Typed Value -> RunMap -> Env DataDecl -> Word32 -> IO ()
+compile path mainVal runMap datas wordSize =do
+  let
+    m = buildModule "test"
+      $ evalStateT (genMain mainVal)
+      $ newCodegen runMap datas wordSize
     replaceExtension ext = reverse . r . reverse
       where
         r []       = []
         r ('.':xs) = reverse ext ++ "." ++ xs
         r (x  :xs) = r xs
+    ofile = File (replaceExtension "o" path)
+  putStrLn $ unpack $ ppllvm m
+  withContext $ \c ->
+    withModuleFromAST c m $ \cm ->
+      withHostTargetMachine $ \tm -> do
+        layout <- getTargetMachineDataLayout tm
+        let
+          spec = defaultCuratedPassSetSpec
+            { optLevel = Just (if debugMode then 0 else 1),
+              dataLayout = Just layout,
+              targetMachine = Just tm }
+        withPassManager spec $ \pm -> runPassManager pm cm
+        writeObjectToFile tm ofile cm
+        mm <- moduleAST cm
+        writeFile (replaceExtension "ll" path) $ unpack $ ppllvm mm
 
 genMain :: Typed Value -> BuilderState Operand
-genMain main = do
+genMain mainVal = do
   wordSize <- gets getWordSize
   llvmFn $ newFn
     { fnName = "main",
@@ -197,13 +186,13 @@ genMain main = do
   where
     generator _ = do
       block `named` "entry"
-      res <- genVal False mainArgs [] main `named` "main.res"
+      res <- genVal False mainArgs [] mainVal `named` "main.res"
       ty <- lift $ genTy retType
       printf (" => " ++ tyFmt ty) [res]
       rcDec 1 res retType
       ret (lcint 32 0)
     (retType, mainArgs) =
-      case typeof main of
+      case typeof mainVal of
         TFunc TUnit r -> (r, [unit])
         r -> (r, [])
 
@@ -258,15 +247,16 @@ genExpr app env (expr ::: ty) =
     App a b -> do
       arg <- genExpr [] env b `named` "app.arg"
       genExpr (arg:app) env a
-    Id name -> do
-      values <- lift $ gets values
-      case lookup name values of
-        Just val -> do
-          genVal False app [] (getInstanceOfValue ty val) `inVal` (show name)
-        Nothing ->
-          case lookup name env of
-            Just (x ::: _) -> genApp ty app x
-            Nothing -> fail ("cannot find name `" ++ show name ++ "`")
+    Id name ->
+      case lookup name env of
+        Just (x ::: _) -> genApp ty app x
+        Nothing -> do
+          s <- lift get
+          case evaluate (name ::: ty) $ getRunMap s of
+            Left err -> fail err
+            Right (val, runMap) -> do
+              put $ s { getRunMap = runMap }
+              genVal False app [] val `inVal` show name
     Op op a b -> do
       let aTy = typeof a
       let bTy = typeof b

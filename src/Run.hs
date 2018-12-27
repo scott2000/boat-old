@@ -1,6 +1,6 @@
 {-# LANGUAGE RecordWildCards #-}
 
-module Run (getInstanceOfValue, evaluateAll, embed) where
+module Run where
 
 import AST
 import Infer (TypeMap (mapTypes))
@@ -9,12 +9,16 @@ import Data.Maybe
 import Control.Monad.State
 import qualified Data.Map as Map
 
-data PossibleValue
-  = Unevaluated (Typed Expr)
-  | Evaluated (Typed Value)
-  | InProgress
+data PossibleValue = PossibleValue
+  { valueExpr :: Typed Expr,
+    valueInstances :: Map.Map Type (Typed Value) }
 
-getInstanceOfValue :: Type -> Typed Value -> Typed Value
+toPossibleValue :: Typed Expr -> PossibleValue
+toPossibleValue expr = PossibleValue
+  { valueExpr = expr,
+    valueInstances = Map.empty }
+
+getInstanceOfValue :: (Show a, TypeMap a) => Type -> Typed a -> Typed a
 getInstanceOfValue targetTy val =
   mapTypes subs val
   where
@@ -29,47 +33,49 @@ getInstanceOfValue targetTy val =
       matchTypes (matchTypes m a0 a1) b0 b1
     matchTypes m _ _ = m
 
-type RunState = StateT (Map.Map Name PossibleValue) (Either String)
+type RunMap = Map.Map Name PossibleValue
+type RunState = StateT RunMap (Either String)
 
-evaluateAll :: Env (Typed Expr) -> Env DataDecl -> Either String (Env (Typed Value))
-evaluateAll valDecls dataDecls =
-  evalStateT (helper $ reverse valDecls)
+evaluateEntry :: Typed Name -> Env (Typed Expr) -> Env DataDecl -> Either String (Typed Value, RunMap)
+evaluateEntry name valDecls dataDecls =
+  evaluate name
   $ initialize valDecls
-  $ Map.map Evaluated
+  $ Map.map toPossibleValue
   $ Map.fromList
   $ concat
   $ map constructorsForData dataDecls
   where
     initialize [] m = m
     initialize ((name, expr):xs) m =
-      initialize xs (Map.insert name (Unevaluated expr) m)
+      initialize xs (Map.insert name (toPossibleValue expr) m)
 
-    helper [] = return []
-    helper ((name, expr):xs) = do
-      m <- get
-      v <- case Map.lookup name m of
-        Just (Evaluated v) -> return v
-        _ -> run expr
-      rest <- helper xs
-      return ((name, v) : rest)
+evaluate :: Typed Name -> RunMap -> Either String (Typed Value, RunMap)
+evaluate name = runStateT $ getValue name
 
-getValue :: Name -> RunState (Typed Value)
-getValue name = do
+getValue :: Typed Name -> RunState (Typed Value)
+getValue (name ::: ty) = do
   m <- get
   case Map.lookup name m of
-    Nothing -> lift $ Left ("cannot find top-level value with name `" ++ show name ++ "`")
-    Just (Unevaluated expr) -> do
-      res <- run expr
-      put (Map.insert name (Evaluated res) m)
-      return res
-    Just (Evaluated val) -> return val
-    Just InProgress -> lift $ Left ("cannot evaluate recursive top-level value `" ++ show name ++ "`")
+    Nothing -> lift $ Left ("cannot find value with name `" ++ show name ++ "`")
+    Just (PossibleValue {..}) ->
+      case Map.lookup ty valueInstances of
+        Nothing -> do
+          val <- run $ getInstanceOfValue ty valueExpr
+          modify $ \m ->
+            let
+              (PossibleValue {..}) = fromJust $ Map.lookup name m
+              new = PossibleValue { valueInstances = Map.insert ty val valueInstances, .. }
+            in
+              Map.insert name new m
+          return val
+        Just val ->
+          return val
 
 run :: Typed Expr -> RunState (Typed Value)
 run (expr ::: ty) =
   case expr of
     Val v -> return $ v ::: ty
-    Id name -> getInstanceOfValue ty <$> getValue name
+    Id name -> getValue (name ::: ty)
     Op op a b -> do
       (_, r, f) <- lift $ getOp op
       (a ::: _) <- run a
