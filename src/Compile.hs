@@ -32,7 +32,6 @@ import LLVM.PassManager (PassSetSpec (..), defaultCuratedPassSetSpec, withPassMa
 import LLVM.Pretty
 
 import Data.Word
-import Data.Maybe
 import Data.List
 import Data.String
 import Control.Monad.State hiding (void)
@@ -43,7 +42,6 @@ import qualified Data.Map as Map
 
 Current Goals:
 
-- printing of output when compiled
 - verification of data types
 - name clash resolution
 - add `rec` keyword for tail recursion
@@ -88,6 +86,7 @@ data Codegen = Codegen
     getDataArrays :: Map.Map [[Type]] Operand,
     getPtrDestructors :: Map.Map [Type] C.Constant,
     getStrings :: Map.Map String (Int, Operand),
+    getReprPrinters :: Map.Map [(Name, [Type])] C.Constant,
     getPtrDestructorCaller :: Maybe Operand,
     getInc :: Maybe Operand,
     getFnDec :: Maybe Operand,
@@ -123,6 +122,7 @@ newCodegen runMap datas wordSize = Codegen
     getDataArrays = Map.empty,
     getPtrDestructors = Map.empty,
     getStrings = Map.empty,
+    getReprPrinters = Map.empty,
     getPtrDestructorCaller = Nothing,
     getInc = Nothing,
     getFnDec = Nothing,
@@ -188,8 +188,9 @@ genMain mainVal = do
     generator _ = do
       block `named` "entry"
       res <- genVal False mainArgs [] mainVal `named` "main.res"
-      ty <- lift $ genTy retType
-      printf (" => " ++ tyFmt ty) [res]
+      printf " => " []
+      printx res retType
+      printf "\n" []
       rcDec 1 res retType
       ret (lcint 32 0)
     (retType, mainArgs) =
@@ -206,7 +207,7 @@ genVal isConstant app env (v ::: ty) =
     Bool True -> bit 1
     Cons name variant list -> do
       datas <- gets datas
-      let DataDecl {..} = fromJust $ lookup name datas
+      let DataDecl {..} = lookup' name datas
       v <- case variants of
         [_] -> do
           let genCons expr = toConstant <$> genVal isConstant [] [] expr
@@ -313,7 +314,7 @@ genExpr app env (expr ::: ty) =
           genExpr [] env expr `named` fromString ("cons." ++ show variant ++ "." ++ show n)
       args <- sequence $ zipWith genCons [0..] list
       datas <- gets datas
-      let DataDecl {..} = fromJust $ lookup name datas
+      let DataDecl {..} = lookup' name datas
       case variants of
         [_] ->
           genStruct args
@@ -335,7 +336,7 @@ genExpr app env (expr ::: ty) =
             number = getVariantId variant variants
   where
     localEnv = toLocalEnv env
-    fromEnv (name, count) = (fromJust $ lookup name env, count)
+    fromEnv (name, count) = (lookup' name env, count)
 
 data GenCase = GenCase
   { casePats :: [Typed Pattern],
@@ -406,7 +407,7 @@ genMatch app env modify = gen
         dec [] m = m
         dec ((name, 0):rest) m = dec rest m
         dec ((name, n):rest) m =
-          let o = fromJust $ lookup name env in
+          let o = lookup' name env in
           dec rest $ addModEntry (-n) o m
         mods = dec decs caseMod
       wordSize <- gets getWordSize
@@ -669,7 +670,7 @@ isRc = go []
     go [] TBool = return False
     go l (TId name) = do
       datas <- gets datas
-      let DataDecl {..} = fromJust $ lookup name datas
+      let DataDecl {..} = lookup' name datas
       case variants of
         [(_, types)] -> anyRc $ for types $ typeReplace typeParams l
         (_:_) -> return True
@@ -708,7 +709,7 @@ allZeroSized (t:ts) = do
 genDataTy :: Name -> [Type] -> BuilderState LLVM.Type
 genDataTy name args = do
   datas <- gets datas
-  let DataDecl {..} = fromJust $ lookup name datas
+  let DataDecl {..} = lookup' name datas
   case variants of
     [(_, types)] -> do
       let tr = typeReplace typeParams args
@@ -726,7 +727,7 @@ getDataVariants = go []
     go l (TApp a b) = go (b:l) a
     go l (TId name) = do
       datas <- gets datas
-      let DataDecl {..} = fromJust $ lookup name datas
+      let DataDecl {..} = lookup' name datas
       let tr = typeReplace typeParams l
       let updateVariant (n, t) = (n, map tr t)
       return $ map updateVariant variants
@@ -735,7 +736,7 @@ typeReplace :: [String] -> [Type] -> Type -> Type
 typeReplace typeParams args = tr
   where
     typeSubstitutions = zip typeParams args
-    tr (TVar v) = fromJust $ lookup v typeSubstitutions
+    tr (TVar v) = lookup' v typeSubstitutions
     tr (TApp a b) = TApp (tr a) (tr b)
     tr other = other
 
@@ -758,6 +759,76 @@ modifierTy isize = LLVM.FunctionType void [ptr isize, isize] False
 -- but in reality it would require more complex analysis to prove that an
 -- increment won't have an effect after the value is passed to a function.
 
+printx :: Operand -> Type -> Builder ()
+printx o = go []
+  where
+    go l (TApp a b) = go (b:l) a
+    go [_, _] TArrow = printf "<func>" []
+    go [] TUnit = printf "unit" []
+    go [] TNat = printf "%llu" [o]
+    go [] TBool = printf "%u" [o]
+    go l (TId name) = do
+      datas <- gets datas
+      let DataDecl {..} = lookup' name datas
+      let tr = typeReplace typeParams l
+      case variants of
+        [(name, [])] ->
+          printf (show name) []
+        [(name, types)] -> do
+          printf ("(" ++ show name) []
+          sequence_ $ for (zip [0..] types) $ \(n, ty) -> do
+            val <- buildExtract o n
+            printf " " []
+            printx val (tr ty)
+          printf ")" []
+        (_:_) -> do
+          printer <- lift $ getPrinter variants
+          llvmFastCall (LLVM.ConstantOperand printer) [(o, [])]
+          return ()
+          where
+            getPrinter variants = do
+              s <- get
+              let
+                printers = getReprPrinters s
+                isize = LLVM.IntegerType (getWordSize s)
+              case Map.lookup variants printers of
+                Nothing -> mdo
+                  put $ s { getReprPrinters = Map.insert variants printer printers }
+                  let
+                    body [v] = mdo
+                      block `named` "entry"
+                      magic <- extractValue v [0] `named` "match.magic"
+                      dataPtr <- extractValue v [1] `named` "match.ptr"
+                      switch magic def branches
+
+                      branches <- sequence $ for (zip [0..] variants) $ \(n, (name, types)) -> do
+                        caseBlock <- block `named` fromString (show name)
+                        if null types then
+                          printf (show name) []
+                        else do
+                          lltypes <- lift $ sequence $ map (genTy . tr) types
+                          castPtr <- bitcast dataPtr (ptr (LLVM.StructureType False (isize : lltypes)))
+                          printf ("(" ++ show name) []
+                          sequence_ $ for (zip [0..] types) $ \(n, ty) -> do
+                            val <- buildGep castPtr n
+                            printf " " []
+                            printx val (tr ty)
+                          printf ")" []
+                        return (C.Int 32 n, caseBlock)
+
+                      def <- block `named` "err"
+                      unreachable
+                  printer <-
+                    llvmConstFn $ newFn
+                      { fnName = "repr." ++ show (Map.size printers) ++ ".",
+                        fnLinkage = L.Private,
+                        fnCC = CC.Fast,
+                        fnRetTy = void,
+                        fnParams = [(tyVariant, ParameterName "variant")],
+                        fnBody = Just body }
+                  return printer
+                Just printer -> return printer
+
 rcInc :: Int -> Operand -> Type -> Builder ()
 rcInc i o = go []
   where
@@ -770,7 +841,7 @@ rcInc i o = go []
     go [] TBool = return ()
     go l (TId name) = do
       datas <- gets datas
-      let DataDecl {..} = fromJust $ lookup name datas
+      let DataDecl {..} = lookup' name datas
       let tr = typeReplace typeParams l
       case variants of
         [(_, types)] ->
@@ -789,7 +860,7 @@ rcDec i o = go []
     go [] TBool = return ()
     go l (TId name) = do
       datas <- gets datas
-      let DataDecl {..} = fromJust $ lookup name datas
+      let DataDecl {..} = lookup' name datas
       let tr = typeReplace typeParams l
       case variants of
         [(_, types)] ->
@@ -907,10 +978,10 @@ incDecAll :: (Operand -> Type -> Builder ())
           -> Builder ()
           -> [Type]
           -> Builder ()
-incDecAll incDec extract middle types = do
-  valuesAndTypes <- getValues 0 types
+incDecAll op extract middle types = do
+  ops <- getValues 0 types
   middle
-  sequence_ $ map (uncurry incDec) valuesAndTypes
+  sequence_ ops
   where
     getValues _ [] = return []
     getValues n (t:ts) = do
@@ -918,7 +989,7 @@ incDecAll incDec extract middle types = do
       if rc then do
         v <- extract n
         rest <- getValues (n+1) ts
-        return ((v, t) : rest)
+        return (op v t : rest)
       else
         getValues (n+1) ts
 
@@ -1103,7 +1174,7 @@ buildStaticClosure free params expr = mdo
           | inc == 1    = return ()
           | otherwise   = rcInc (inc-1) o ty
           where
-            (o ::: ty) = fromJust $ lookup name env
+            (o ::: ty) = lookup' name env
     anons = anonymousFunctions codegen
     currentValue = getFunctionName codegen
     len = length anons
@@ -1467,7 +1538,7 @@ printf fmt args = do
       lift $ put $ s { getPrintf = Just printf }
       return printf
     Just printf -> return printf
-  (count, str) <- emitString (fmt ++ "\n")
+  (count, str) <- emitString fmt
   call printf ((str, []) : map (\x -> (x, [])) args) `named` (fromString ("_" ++ show count))
   return ()
 

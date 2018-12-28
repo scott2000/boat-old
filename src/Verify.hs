@@ -6,7 +6,6 @@ module Verify where
 import AST
 
 import Data.List
-import Data.Maybe
 
 data VPattern
   = VAny
@@ -60,7 +59,7 @@ verifyExpr datas = ver
     enumerate TNat = [(Name ["0"], []), (Name ["1 +"], [VAny])]
     enumerate TBool = [(Name ["false"], []), (Name ["true"], [])]
     enumerate (TId name) =
-      let DataDecl {..} = fromJust $ lookup name datas in
+      let DataDecl {..} = lookup' name datas in
       for variants $ \
         (name, types) -> (name, defaultVPats $ length types)
     go :: [Typed Pattern] -> [VPattern] -> [[VPattern]]

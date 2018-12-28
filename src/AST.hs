@@ -53,12 +53,12 @@ data Pattern
 data Decls = Decls
   { valDecls :: Env (Typed Expr),
     dataDecls :: Env DataDecl }
-  deriving Eq
+  deriving (Show, Eq)
 
 data DataDecl = DataDecl
   { typeParams :: [String],
     variants :: Env [Type] }
-  deriving Eq
+  deriving (Show, Eq)
 
 newtype Name = Name
   { unname :: [String] }
@@ -101,7 +101,7 @@ instance Show Value where
   show (Bool False) = "false"
   show (Cons _ variant []) = show variant
   show (Cons _ variant vals) = "(" ++ intercalate " " (show variant : map show vals) ++ ")"
-  show (Func xs expr) = "(\\" ++ unwords (map show xs) ++ " -> " ++ show expr ++ ")"
+  show (Func xs expr) = "<func>"
 
 instance Show Pattern where
   show (PAny Nothing) = "_"
@@ -378,7 +378,7 @@ mkFuncTy (x:xs) r = TFunc x (mkFuncTy xs r)
 
 tIdVar :: Name -> Type
 tIdVar (name@(Name [s])) =
-  if head s `elem` ['A'..'Z'] then
+  if isCap $ head s then
     TId name
   else
     TVar s
@@ -386,14 +386,27 @@ tIdVar name = TId name
 
 pIdVar :: Name -> Pattern
 pIdVar (name@(Name [s])) =
-  if head s `elem` ['A'..'Z'] then
+  if isCap $ head s then
     PCons name []
   else
     PAny $ Just $ name
 pIdVar name = PCons name []
 
+isCap :: Char -> Bool
+isCap ch
+  | ch `elem` ['A'..'Z'] || ch == '_' = True
+  | otherwise = False
+
 for :: [a] -> (a -> b) -> [b]
 for = flip map
+
+lookup' :: (Eq k, Show k, Show v) => k -> [(k, v)] -> v
+lookup' name xs = go xs
+  where
+    go [] = error ("cannot find `" ++ show name ++ "` in " ++ show xs)
+    go ((n,x):xs)
+      | n == name = x
+      | otherwise = go xs
 
 pattern Internal :: String -> Name
 pattern Internal s = Name [{- "internal", -}s]
