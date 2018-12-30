@@ -114,6 +114,7 @@ funApp (f ::: fty) (x ::: _) =
           lift $ Left ("application to non-function type: " ++ show fty)
 
 runCases :: [MatchCase] -> [Typed Value] -> RunState (Typed Value)
+runCases [] ((v ::: ty):_) = lift $ Left ("invalid value for type " ++ show ty ++ ": " ++ show v)
 runCases ((ps, expr):cs) vs =
   case tryAllPatterns ps vs expr of
     Just expr -> run expr
@@ -141,6 +142,7 @@ tryPattern p v expr =
     (PCons n0 l0, Cons _ n1 l1)
       | n0 == n1 -> tryAllPatterns l0 l1 expr
       | otherwise -> Nothing
+    _ -> Nothing
 
 embed :: Typed Value -> Typed Expr
 embed (v ::: t) = Val v ::: t
