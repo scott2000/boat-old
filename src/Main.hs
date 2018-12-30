@@ -213,11 +213,12 @@ repl = go ""
                                                     ++ show (typeof evaluated) ++ reset
                                     | otherwise   = str
                                   output = typeInfo $ show evaluated
+                                  newVals = changeVal (resName, Val (valof evaluated) ::: typeof evaluated) inferred
                                 lift $ outputStrLn output
                                 put $ ReplState
                                   { replNextAnon = newAnon,
                                     replNextExpr = replNextExpr+1,
-                                    replDecls = replDecls { valDecls = inferred },
+                                    replDecls = replDecls { valDecls = newVals },
                                     replFirst = True,
                                     .. }
                                 repl

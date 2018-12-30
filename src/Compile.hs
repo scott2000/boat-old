@@ -42,8 +42,6 @@ import qualified Data.Map as Map
 
 Current Goals:
 
-- verification of data types
-- name clash resolution
 - add `rec` keyword for tail recursion
 - better error handling
 - char, int, float types
@@ -53,8 +51,10 @@ Current Goals:
 - prefix and suffix operators (use ~ for negation?)
 - module system for multiple files
 - replace Unit and Bool with user-defined types (bools currently won't pattern match)
+- name clash resolution (currently undefined behavior in many situations)
 - user-defined operators (generalized names)
 - typeclasses and constraints
+- full generic type verification (kinds for type parameters)
 - standard library
 
 Possible Future Optimizations:
