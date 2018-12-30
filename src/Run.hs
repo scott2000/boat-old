@@ -95,11 +95,14 @@ run (expr ::: ty) =
       run $ substitute name (Val v) expr
     Match exprs cases ->
       sequence (map run exprs) >>= runCases cases
-    Panic [] -> lift $ Left "attempted to evaluate `panic`"
+    Panic [] -> lift $ Left emptyPanic
     Panic msg -> lift $ Left msg
     ICons name variant list -> do
       val <- sequence $ map run list
       return $ Cons name variant val ::: ty
+
+emptyPanic :: String
+emptyPanic = "attempted to evaluate `panic`"
 
 funApp :: Typed Value -> Typed Value -> RunState (Typed Value)
 funApp (f ::: fty) (x ::: _) =

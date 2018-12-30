@@ -45,6 +45,7 @@ Current Goals:
 - add `rec` keyword for tail recursion
 - better error handling
 - char, int, float types
+- slices/arrays/strings?
 - nat and bool pattern verification (or add normal constructors and patterns with syntactic sugar)
 - string, list, tuple syntactic sugar
 - compile-time simplification (with gas limit)
@@ -303,7 +304,10 @@ genExpr app env (expr ::: ty) =
       ok <- block `named` "match.ok"
       phi phiCases
     Panic msg -> do
-      puts msg
+      if null msg then
+        puts emptyPanic
+      else
+        puts msg
       exit 1
       gen <- lift $ genTy ty
       return $ LLVM.ConstantOperand $ C.Undef gen
