@@ -1,6 +1,4 @@
-{-# LANGUAGE RecursiveDo #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RecursiveDo, OverloadedStrings, RecordWildCards #-}
 
 module Compile (compile) where
 
@@ -607,7 +605,7 @@ genMatch app env modify = gen
               (branches, blocks') <- consBranches (Map.toList cases) blocks
               return blocks'
 
-getVariantId :: Name -> [(Name, a)] -> Integer
+getVariantId :: String -> [(String, a)] -> Integer
 getVariantId name = go 0
  where
    go acc ((n, _):ns)
@@ -733,7 +731,7 @@ getDataVariants = go []
       datas <- gets datas
       let DataDecl {..} = lookup' name datas
       let tr = typeReplace typeParams l
-      let updateVariant (n, t) = (n, map tr t)
+      let updateVariant (n, t) = (name.|.n, map tr t)
       return $ map updateVariant variants
 
 typeReplace :: [String] -> [Type] -> Type -> Type
@@ -759,10 +757,6 @@ destructorTy = LLVM.FunctionType void [ptr i8] False
 modifierTy :: LLVM.Type -> LLVM.Type
 modifierTy isize = LLVM.FunctionType void [ptr isize, isize] False
 
--- It seems like a good idea not to increment or decrement constant values;
--- but in reality it would require more complex analysis to prove that an
--- increment won't have an effect after the value is passed to a function.
-
 printx :: Operand -> Type -> Builder ()
 printx o = go []
   where
@@ -786,7 +780,8 @@ printx o = go []
             printx val (tr ty)
           printf ")" []
         (_:_) -> do
-          printer <- lift $ getPrinter variants
+          let toGlobal (n, x) = (name.|.n, x)
+          printer <- lift $ getPrinter $ map toGlobal variants
           llvmFastCall (LLVM.ConstantOperand printer) [(o, [])]
           return ()
           where

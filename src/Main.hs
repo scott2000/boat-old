@@ -1,5 +1,4 @@
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE RecordWildCards, NamedFieldPuns #-}
 
 module Main where
 
@@ -19,6 +18,7 @@ import System.Environment (getArgs)
 import Data.Word
 import Text.Megaparsec
 import Control.Monad.State
+import qualified Data.Map as Map
 
 version :: String
 version = "0.1.0"
@@ -47,18 +47,17 @@ startCompile path = do
   file <- readFile path
   putStr $ dropWhile ('\n' ==) file
   header "parsed"
-  let parser = runCustomParser 0 declsParser
+  let parser = runCustomParser 0 moduleParser
   case runParser parser path file of
     Left err -> putStr (errorFmt ++ "syntax error: " ++ reset ++ errorBundlePretty err) >> flushOut >> exitFailure
-    Right (decls, nextAnon) -> do
-      let datas = dataDecls decls
-      putStr $ unlines $ map showDataDecl $ datas
-      putStr $ unlines $ map showValDecl $ valDecls decls
+    Right (tree, nextAnon) -> do
+      putStrLn $ show $ tree
       header "inferred"
-      case inferAll nextAnon decls of
+      let (datas, values) = treeCollect tree
+      case inferAll nextAnon datas values of
         Left err -> printerr err
         Right (inferred, _) -> do
-          putStr $ unlines $ map showValDecl inferred
+          putStr $ unlines $ for inferred $ \(n, _ ::: ty) -> show n ++ " : " ++ show ty
           header "evaluate"
           case findNamed (Name ["main"]) inferred of
             Left err -> printerr err
@@ -75,19 +74,21 @@ startCompile path = do
 
 type Repl = StateT ReplState (InputT IO)
 
+-- TODO use separate list for res0, res1, res2, etc?
 data ReplState = ReplState
   { replNextAnon :: Word64,
     replNextExpr :: Word64,
     replSetInfo :: Bool,
-    replDecls :: Decls,
-    replFirst :: Bool }
+    replFirst :: Bool,
+    replDatas :: Map.Map Name DataDecl,
+    replValues :: Map.Map Name (Typed Expr) }
 
 data ReplResult
   = Quit
   | Ignore
   | Reset
-  | DeclareVal (Name, Typed Expr)
-  | DeclareData (Name, DataDecl)
+  | DeclareVal (String, Typed Expr)
+  | DeclareData (String, DataDecl)
   | Eval (Typed Expr)
 
 defaultRepl :: ReplState
@@ -95,8 +96,9 @@ defaultRepl = ReplState
   { replNextAnon = 0,
     replNextExpr = 0,
     replSetInfo = False,
-    replDecls = emptyDecls,
-    replFirst = True }
+    replFirst = True,
+    replDatas = Map.empty,
+    replValues = Map.empty }
 
 startRepl :: IO ()
 startRepl = do
@@ -182,29 +184,28 @@ repl = go ""
                   Reset -> do
                     put defaultRepl
                     repl
-                  DeclareVal val
+                  DeclareVal (name, val)
                     | invalidName name ->
                       outputError ("cannot declare value with name `" ++ name ++ "`, try `result" ++ drop 3 name ++ "` instead")
                     | otherwise -> do
-                      modify $ \s -> s { replDecls = changeValDecl val (replDecls s), replFirst = False }
+                      modify $ \s -> s { replValues = Map.insert (Name [name]) val (replValues s), replFirst = False }
                       repl
-                    where
-                      name = show $ fst val
-                  DeclareData data' -> do
-                    modify $ \s -> s { replDecls = changeDataDecl data' (replDecls s), replFirst = False }
+                  DeclareData (name, data') -> do
+                    modify $ \s -> s { replDatas = Map.insert (Name [name]) data' (replDatas s), replFirst = False }
                     repl
                   Eval expr -> do
                     ReplState {..} <- get
                     let
                       resName = Name [replRes]
-                      newDecls = changeValDecl (resName, expr) replDecls
-                    case inferAll replNextAnon newDecls of
+                      dataDecls = Map.toList replDatas
+                      valDecls = (resName, expr) : Map.toList replValues
+                    case inferAll replNextAnon dataDecls valDecls of
                       Left err -> outputError err
                       Right (inferred, newAnon) ->
                         case findNamed resName inferred of
                           Left err -> outputError err
                           Right typedName ->
-                            case evaluateEntry typedName inferred $ dataDecls newDecls of
+                            case evaluateEntry typedName inferred dataDecls of
                               Left err -> outputError err
                               Right (evaluated, _) -> do
                                 let
@@ -213,18 +214,17 @@ repl = go ""
                                                     ++ show (typeof evaluated) ++ reset
                                     | otherwise   = str
                                   output = typeInfo $ show evaluated
-                                  newVals = changeVal (resName, embed evaluated) inferred
                                 lift $ outputStrLn output
                                 put $ ReplState
                                   { replNextAnon = newAnon,
                                     replNextExpr = replNextExpr+1,
-                                    replDecls = replDecls { valDecls = newVals },
                                     replFirst = True,
+                                    replValues = Map.insert resName (embed evaluated) $ Map.fromList inferred,
                                     .. }
                                 repl
 
 unfinished :: String -> Maybe Char
-unfinished str = foldl (<|>) Nothing $ map check [('(', ')'), ('[', ']'), ('{', '}')]
+unfinished str = foldl1 (<|>) $ map check [('(', ')'), ('[', ']'), ('{', '}')]
   where
     check (a, b) =
       case compare (count a) (count b) of
@@ -247,18 +247,6 @@ invalidName ('r':'e':'s':n)
     isDigit n = n `elem` ['0'..'9']
 invalidName _ = False
 
-changeValDecl :: (Name, Typed Expr) -> Decls -> Decls
-changeValDecl val Decls {..} = Decls { valDecls = changeVal val valDecls, .. }
-
-changeDataDecl :: (Name, DataDecl) -> Decls -> Decls
-changeDataDecl data' Decls {..} = Decls { dataDecls = changeVal data' dataDecls, .. }
-
-changeVal :: Eq k => (k, v) -> [(k, v)] -> [(k, v)]
-changeVal entry [] = [entry]
-changeVal entry (x:xs)
-  | fst x == fst entry = entry : xs
-  | otherwise          = x : changeVal entry xs
-
 iterRepl :: String -> Repl ReplResult
 iterRepl (':' : commands) = parseCommands commands
 iterRepl string = do
@@ -275,7 +263,7 @@ iterRepl string = do
 parseRepl :: Word64 -> Parser ReplResult
 parseRepl n = DeclareVal <$> parseReplVal n <|> DeclareData <$> dataDeclParser <|> Eval <$> parseReplExpr n
 
-parseReplVal :: Word64 -> Parser (Name, Typed Expr)
+parseReplVal :: Word64 -> Parser (String, Typed Expr)
 parseReplVal 0 = valDeclParser
 parseReplVal n = do
   (name, expr) <- valDeclParser
@@ -302,17 +290,21 @@ parseCommands commands =
           "  :help           display this help info",
           "  :clear          clear the display",
           "  :reset          clear and reset all declarations",
-          "  :list [all]     list declarations (`all` includes results)",
+          "  :list           list declarations",
           "  :info [on|off]  toggle info",
           "  :quit           exit the repl",
           "" ]
       return Ignore
     ("clear", _) -> clear >> return Ignore
     ("reset", _) -> clear >> return Reset
-    ("list", "all") -> list True
-    ("list", []) -> list False
-    ("list", _) ->
-      outputError "command `list` expects either no argument or `all`"
+    ("list", _) -> do
+      ReplState {..} <- get
+      let
+        showFst (a, b) = (show a, b)
+        datas = unlines $ map (showData . showFst) $ Map.toList replDatas
+        values = unlines $ map (showVal . showFst) $ Map.toList replValues
+      lift $ outputStrLn (datas ++ values)
+      return Ignore
     ("info", "on") -> setInfo $ const True
     ("info", "off") -> setInfo $ const False
     ("info", []) -> setInfo not
@@ -334,17 +326,6 @@ parseCommands commands =
     outputError str = do
       lift $ outputStrLn (errorFmt ++ "error: " ++ reset ++ str)
       return Ignore
-
-list :: Bool -> Repl ReplResult
-list a = do
-  decls <- gets replDecls
-  let vals = valDecls decls
-  lift $ sequence_ $ map (outputStrLn . showValDecl) $
-    if a then
-      vals
-    else
-      filter (not . invalidName . show . fst) vals
-  return Ignore
 
 setInfo :: (Bool -> Bool) -> Repl ReplResult
 setInfo f = do
@@ -373,12 +354,18 @@ consumeSpaces other = other
 flushOut :: IO ()
 flushOut = hFlush stdout
 
-declsParser :: Parser Decls
-declsParser = followedByEnd manyDecls
+moduleParser :: Parser ModuleTree
+moduleParser = decl emptyModule
   where
-    decl = addDataDecl <$> dataDeclParser
-      <|> addValDecl <$> valDeclParser
-    manyDecls = try (decl <*> manyDecls) <|> return emptyDecls
+    decl current = data' <|> value <|> (sc' >> eof >> return current)
+      where
+        p parser add = do
+          (name, val) <- parser
+          case add name val current of
+            Right new -> decl new
+            Left err -> fail err
+        data' = p dataDeclParser addDataDecl
+        value = p valDeclParser addValDecl
 
 followedByEnd :: Parser a -> Parser a
 followedByEnd p = do

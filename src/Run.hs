@@ -142,8 +142,8 @@ tryPattern p v expr =
     (PBool b0, Bool b1)
       | b0 == b1 -> Just expr
       | otherwise -> Nothing
-    (PCons n0 l0, Cons _ n1 l1)
-      | n0 == n1 -> tryAllPatterns l0 l1 expr
+    (PCons n0 l0, Cons n n1 l1)
+      | n0 == n...n1 -> tryAllPatterns l0 l1 expr
       | otherwise -> Nothing
     _ -> Nothing
 

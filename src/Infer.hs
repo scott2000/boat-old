@@ -44,8 +44,8 @@ type DepEntry = (Name, Set.Set Name)
 type MultiDepEntry = (Set.Set Name, Set.Set Name)
 
 --TODO refactor to use StateT vs explicit Word64 passing?
-inferAll :: Word64 -> Decls -> Either String (Env (Typed Expr), Word64)
-inferAll count Decls {..} = do
+inferAll :: Word64 -> Env DataDecl -> Env (Typed Expr) -> Either String (Env (Typed Expr), Word64)
+inferAll count dataDecls valDecls = do
   verifyData dataDecls
   let allDeps = depList True valDecls
   let grouped = groupCycles allDeps

@@ -1,6 +1,4 @@
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RecordWildCards, NamedFieldPuns, LambdaCase #-}
 
 module Verify where
 
@@ -96,14 +94,14 @@ verifyExpr datas = ver
             Left ("pattern match is missing cases:\n" ++ unlines (map (("  "++) . intercalate " " . map show) result))
         ICons _ _ xs -> sequence_ $ map ver xs
         _ -> Right ()
-    enumerate :: Type -> [(Name, [VPattern])]
+    enumerate :: Type -> Env [VPattern]
     enumerate (TApp a _) = enumerate a
     enumerate TNat = [(Name ["0"], []), (Name ["1 +"], [VAny])]
     enumerate TBool = [(Name ["false"], []), (Name ["true"], [])]
     enumerate (TId name) =
       let DataDecl {..} = lookup' name datas in
       for variants $ \
-        (name, types) -> (name, defaultVPats $ length types)
+        (vname, types) -> (name.|.vname, defaultVPats $ length types)
     go :: [Typed Pattern] -> [VPattern] -> [[VPattern]]
     go [] [] = []
     go ((PAny _ ::: _) : ps) (v:vs) = map (v:) $ go ps vs

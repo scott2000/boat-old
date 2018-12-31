@@ -1,5 +1,4 @@
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE FlexibleInstances, NamedFieldPuns #-}
 
 module Parser where
 import AST
@@ -53,16 +52,16 @@ class Parsable a where
 keywords :: [String]
 keywords = ["data", "val", "let", "match", "in", "unit", "true", "false", "if", "then", "else", "panic", "_"]
 
-valDeclParser :: Parser (Name, Typed Expr)
+valDeclParser :: Parser (String, Typed Expr)
 valDeclParser = label "value declaration" $ do
   try $ symbol $ key "val"
-  name <- name
+  name <- identifier
   ty <- parseAscription
   symbol $ string "="
   expr <- parser
   (,) name <$> ascribe expr ty
 
-dataDeclParser :: Parser (Name, DataDecl)
+dataDeclParser :: Parser (String, DataDecl)
 dataDeclParser = label "data declaration" $ do
   try $ symbol $ key "data"
   (name, typeParams) <- variant
@@ -81,9 +80,9 @@ dataDeclParser = label "data declaration" $ do
       variant
     singleline = (:) <$> variant <*> manyVariants
 
-variant :: Parser (Name, [Type])
+variant :: Parser (String, [Type])
 variant = symbol $ do
-  name <- name
+  name <- identifier
   types <- many (try parserNoSpace)
   return (name, types)
 
