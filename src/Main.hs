@@ -251,7 +251,7 @@ iterRepl :: String -> Repl ReplResult
 iterRepl (':' : commands) = parseCommands commands
 iterRepl string = do
   ReplState {..} <- get
-  let parser = runCustomParser replNextAnon $ followedByEnd $ parseRepl replNextExpr
+  let parser = runCustomParser replNextAnon $ parseRepl replNextExpr
   case runParser parser "<repl>" string of
     Left err -> lift $ do
       outputStr (errorFmt ++ "syntax error: " ++ reset ++ errorBundlePretty err)
@@ -353,22 +353,3 @@ consumeSpaces other = other
 
 flushOut :: IO ()
 flushOut = hFlush stdout
-
-moduleParser :: Parser ModuleTree
-moduleParser = decl emptyModule
-  where
-    decl current = data' <|> value <|> (sc' >> eof >> return current)
-      where
-        p parser add = do
-          (name, val) <- parser
-          case add name val current of
-            Right new -> decl new
-            Left err -> fail err
-        data' = p dataDeclParser addDataDecl
-        value = p valDeclParser addValDecl
-
-followedByEnd :: Parser a -> Parser a
-followedByEnd p = do
-  res <- p
-  sc' >> eof
-  return res

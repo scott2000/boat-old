@@ -23,7 +23,13 @@ type MParser = Parsec Void String
 type Parser = ReaderT LinePosition (StateT AnonCount MParser)
 
 runCustomParser :: AnonCount -> Parser a -> MParser (a, AnonCount)
-runCustomParser c p = runStateT (runReaderT p (0, True)) c
+runCustomParser c p = runStateT (runReaderT (followedByEnd p) (0, True)) c
+
+followedByEnd :: Parser a -> Parser a
+followedByEnd p = do
+  res <- p
+  sc' >> eof
+  return res
 
 blockOf :: Parser a -> Parser a
 blockOf p = do
@@ -50,24 +56,49 @@ class Parsable a where
   parsedApp :: a -> a -> Parser a
 
 keywords :: [String]
-keywords = ["data", "val", "let", "match", "in", "unit", "true", "false", "if", "then", "else", "panic", "_"]
+keywords = ["mod", "data", "val", "let", "match", "in", "unit", "true", "false", "if", "then", "else", "panic", "_"]
+
+moduleParser :: Parser ModuleTree
+moduleParser = decl emptyModule
+  where
+    decl current = symbol (module' <|> data' <|> value <|> return current)
+      where
+        p parser add = do
+          (name, val) <- parser
+          case add name val current of
+            Right new -> decl new
+            Left err -> fail err
+        module' = p modDeclParser addSubModule
+        data' = p dataDeclParser addDataDecl
+        value = p valDeclParser addValDecl
+
+modDeclParser :: Parser (String, ModuleTree)
+modDeclParser = label "module declaration" $ do
+  try $ key "mod"
+  name <- anyIndent identifier
+  m <- blockOf moduleParser
+  return (name, m)
 
 valDeclParser :: Parser (String, Typed Expr)
 valDeclParser = label "value declaration" $ do
-  try $ symbol $ key "val"
-  name <- identifier
-  ty <- parseAscription
-  symbol $ string "="
-  expr <- parser
+  try $ key "val"
+  (name, ty) <- anyIndent $ do
+    name <- identifier
+    ty <- parseAscription
+    symbol $ string "="
+    return (name, ty)
+  expr <- blockOf parser
   (,) name <$> ascribe expr ty
 
 dataDeclParser :: Parser (String, DataDecl)
 dataDeclParser = label "data declaration" $ do
-  try $ symbol $ key "data"
-  (name, typeParams) <- variant
-  tp <- sequence $ map into typeParams
-  symbol $ string "="
-  variants <- multiline <|> singleline
+  try $ key "data"
+  (name, tp) <- anyIndent $ do
+    (name, typeParams) <- variant
+    tp <- sequence $ map into typeParams
+    symbol $ string "="
+    return (name, tp)
+  variants <- blockOf (multiline <|> singleline)
   return (name, DataDecl { typeParams = tp, variants })
   where
     into (TVar s) = return s
@@ -111,7 +142,7 @@ instance Parsable (Typed Expr) where
   parsedApp a b = typed $ return $ App a b
 
 instance Parsable Type where
-  parsePartial = label "type" $ try paren
+  parsePartial = label "type" $ paren
     <|> try (tIdVar <$> name)
     <|> try (symbol $ key "_" >> newType)
 
