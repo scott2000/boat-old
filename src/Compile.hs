@@ -40,6 +40,9 @@ import qualified Data.Map as Map
 
 Current Goals:
 
+- multiple files for modules
+- repl support for modules (reimplement?)
+- data modules (constructors in separate module, module extension)
 - add `rec` keyword for tail recursion
 - better error handling
 - char, int, float types
@@ -48,9 +51,9 @@ Current Goals:
 - string, list, tuple syntactic sugar
 - compile-time simplification (with gas limit)
 - prefix and suffix operators (use ~ for negation?)
-- module system for multiple files
 - replace Unit and Bool with user-defined types (bools currently won't pattern match)
 - name clash resolution (currently undefined behavior in many situations)
+- name resolution based on namespaces (module/data/value)
 - user-defined operators (generalized names)
 - typeclasses and constraints
 - full generic type verification (kinds for type parameters)
@@ -85,7 +88,7 @@ data Codegen = Codegen
     getDataArrays :: Map.Map [[Type]] Operand,
     getPtrDestructors :: Map.Map [Type] C.Constant,
     getStrings :: Map.Map String (Int, Operand),
-    getReprPrinters :: Map.Map [(Name, [Type])] C.Constant,
+    getReprPrinters :: Map.Map [(String, [Type])] C.Constant,
     getPtrDestructorCaller :: Maybe Operand,
     getInc :: Maybe Operand,
     getFnDec :: Maybe Operand,
@@ -771,17 +774,16 @@ printx o = go []
       let tr = typeReplace typeParams l
       case variants of
         [(name, [])] ->
-          printf (show name) []
+          printf name []
         [(name, types)] -> do
-          printf ("(" ++ show name) []
+          printf ("(" ++ name) []
           sequence_ $ for (zip [0..] types) $ \(n, ty) -> do
             val <- buildExtract o n
             printf " " []
             printx val (tr ty)
           printf ")" []
         (_:_) -> do
-          let toGlobal (n, x) = (name.|.n, x)
-          printer <- lift $ getPrinter $ map toGlobal variants
+          printer <- lift $ getPrinter variants
           llvmFastCall (LLVM.ConstantOperand printer) [(o, [])]
           return ()
           where
@@ -801,13 +803,13 @@ printx o = go []
                       switch magic def branches
 
                       branches <- sequence $ for (zip [0..] variants) $ \(n, (name, types)) -> do
-                        caseBlock <- block `named` fromString (show name)
+                        caseBlock <- block `named` fromString name
                         if null types then
-                          printf (show name) []
+                          printf name []
                         else do
                           lltypes <- lift $ sequence $ map (genTy . tr) types
                           castPtr <- bitcast dataPtr (ptr (LLVM.StructureType False (isize : lltypes)))
-                          printf ("(" ++ show name) []
+                          printf ("(" ++ name) []
                           sequence_ $ for (zip [0..] types) $ \(n, ty) -> do
                             val <- buildGep castPtr n
                             printf " " []

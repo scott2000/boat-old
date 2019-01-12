@@ -56,31 +56,56 @@ class Parsable a where
   parsedApp :: a -> a -> Parser a
 
 keywords :: [String]
-keywords = ["mod", "data", "val", "let", "match", "in", "unit", "true", "false", "if", "then", "else", "panic", "_"]
+keywords = ["use", "mod", "data", "val", "let", "match", "in", "unit", "true", "false", "if", "then", "else", "panic", "_"]
 
-moduleParser :: Parser ModuleTree
-moduleParser = decl emptyModule
+moduleParser :: Name -> ModuleTree -> Parser ModuleTree
+moduleParser path current =
+  symbol (use <|> module' <|> data' <|> value <|> return current)
   where
-    decl current = symbol (module' <|> data' <|> value <|> return current)
-      where
-        p parser add = do
-          (name, val) <- parser
-          case add name val current of
-            Right new -> decl new
-            Left err -> fail err
-        module' = p modDeclParser addSubModule
-        data' = p dataDeclParser addDataDecl
-        value = p valDeclParser addValDecl
+    use = do
+      paths <- useDeclParser
+      moduleParser path $ addUseDecls paths current
+    p parser add = do
+      (name, val) <- parser
+      case add name val current of
+        Right new -> moduleParser path new
+        Left err -> fail err
+    module' = p (modDeclParser path) addSubModule
+    data' = p dataDeclParser (addDataDecl path)
+    value = p valDeclParser addValDecl
 
-modDeclParser :: Parser (String, ModuleTree)
-modDeclParser = label "module declaration" $ do
+modDeclParser :: Name -> Parser (String, ModuleTree)
+modDeclParser path = label "mod declaration" $ do
   try $ key "mod"
   name <- anyIndent identifier
-  m <- blockOf moduleParser
+  m <- blockOf $ moduleParser (path...name) emptyModule
   return (name, m)
 
+useDeclParser :: Parser [UsePath]
+useDeclParser = label "use declaration" $ do
+  try $ key "use"
+  anyIndent $ symbol usePaths
+
+usePaths :: Parser [UsePath]
+usePaths = manyPaths <|> singlePath
+  where
+    singlePath = (:[]) <$> usePath
+    manyPaths = do
+      firstPath <- char '(' >> symbol usePath
+      restPaths <- some $ try (sc' >> char ',' >> symbol usePath)
+      sc' >> ((char ',' >> sc') <|> return ()) >> char ')'
+      return (firstPath : restPaths)
+
+usePath :: Parser UsePath
+usePath = useAll <|> useOne
+  where
+    useAll = char '_' >> return UseAll
+    useOne = do
+      name <- identifier
+      UseModule name <$> (char '.' >> usePaths) <|> return (UseMember name)
+
 valDeclParser :: Parser (String, Typed Expr)
-valDeclParser = label "value declaration" $ do
+valDeclParser = label "val declaration" $ do
   try $ key "val"
   (name, ty) <- anyIndent $ do
     name <- identifier
@@ -135,6 +160,7 @@ instance Parsable (Typed Expr) where
     <|> try (symbol $ key "true" >> return (Val (Bool True) ::: TBool))
     <|> try (symbol $ key "false" >> return (Val (Bool False) ::: TBool))
     <|> (::: TNat) <$> Val <$> Nat <$> try number
+    -- TODO fix bug: (3 : Nat) => cannot ascribe type Nat to expression of type Internal.Nat
 
   parsedOp "->" _ _ = fail ("cannot use (->) operator in expression")
   parsedOp op a b = typed $ return $ Op op a b

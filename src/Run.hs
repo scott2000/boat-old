@@ -36,14 +36,9 @@ getInstanceOfValue targetTy val =
 type RunMap = Map.Map Name PossibleValue
 type RunState = StateT RunMap (Either String)
 
-evaluateEntry :: Typed Name -> Env (Typed Expr) -> Env DataDecl -> Either String (Typed Value, RunMap)
-evaluateEntry name valDecls dataDecls =
-  evaluate name
-  $ initialize valDecls
-  $ Map.map toPossibleValue
-  $ Map.fromList
-  $ concat
-  $ map constructorsForData dataDecls
+evaluateEntry :: Typed Name -> Env (Typed Expr) -> Either String (Typed Value, RunMap)
+evaluateEntry name valDecls =
+  evaluate name $ initialize valDecls Map.empty
   where
     initialize [] m = m
     initialize ((name, expr):xs) m =
@@ -143,7 +138,7 @@ tryPattern p v expr =
       | b0 == b1 -> Just expr
       | otherwise -> Nothing
     (PCons n0 l0, Cons n n1 l1)
-      | n0 == n...n1 -> tryAllPatterns l0 l1 expr
+      | n0 == n.|.n1 -> tryAllPatterns l0 l1 expr
       | otherwise -> Nothing
     _ -> Nothing
 

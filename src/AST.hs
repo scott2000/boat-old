@@ -51,9 +51,16 @@ data Pattern
   deriving Eq
 
 data ModuleTree = ModuleTree
-  { treeModules :: Map.Map String ModuleTree,
+  { treeImports :: [UsePath],
+    treeModules :: Map.Map String ModuleTree,
     treeDatas :: Map.Map String DataDecl,
     treeValues :: Map.Map String (Typed Expr) }
+  deriving Eq
+
+data UsePath
+  = UseAll
+  | UseMember String
+  | UseModule String [UsePath]
   deriving Eq
 
 data DataDecl = DataDecl
@@ -69,6 +76,8 @@ newtype Name = Name
 type Env a = [(Name, a)]
 
 instance Show Expr where
+  show (Val (Func xs expr)) =
+    "(\\" ++ intercalate " " (map show xs) ++ " -> " ++ show expr ++ ")"
   show (Val v) = show v
   show (Id name) = show name
   show (Op op a b) = "(" ++ show a ++ " " ++ op ++ " " ++ show b ++ ")"
@@ -78,9 +87,9 @@ instance Show Expr where
   show (Match exprs cases) = "(match " ++ intercalate " " (map show exprs) ++ " in\n" ++ intercalate "\n" (map showCase cases) ++ ")"
   show (Panic []) = "(panic\n)"
   show (Panic msg) = "(panic " ++ msg ++ "\n)"
-  show (ICons name variant []) = show (name.|.variant)
-  show (ICons name variant list) =
-    "(" ++ intercalate " " (show (name.|.variant) : map show list) ++ ")"
+  show (ICons _ variant []) = variant
+  show (ICons _ variant list) =
+    "(" ++ intercalate " " (variant : map show list) ++ ")"
 
 showCase :: MatchCase -> String
 showCase (p, e) = "  " ++ intercalate " " (map show p) ++ " -> " ++ show e
@@ -94,16 +103,16 @@ instance Show Type where
   show (TApp a b) = "(" ++ show a ++ " " ++ show b ++ ")"
 
 instance Show a => Show (Typed a) where
-  show (x ::: t) = show x
+  show (x ::: _) = show x
 
 instance Show Value where
   show Unit = "unit"
   show (Nat n) = show n
   show (Bool True) = "true"
   show (Bool False) = "false"
-  show (Cons name variant []) = show (name.|.variant)
-  show (Cons name variant vals) =
-    "(" ++ intercalate " " (show (name.|.variant) : map show vals) ++ ")"
+  show (Cons _ variant []) = variant
+  show (Cons _ variant vals) =
+    "(" ++ intercalate " " (variant : map show vals) ++ ")"
   show (Func xs expr) = "<func>"
 
 instance Show Pattern where
@@ -117,12 +126,24 @@ instance Show Pattern where
 
 instance Show ModuleTree where
   show ModuleTree {..} =
-    intercalate "\n" (
-      map m (Map.toList treeModules)
+    intercalate "\n" $
+      map u treeImports
+      ++ map m (Map.toList treeModules)
       ++ map showData (Map.toList treeDatas)
-      ++ map showVal (Map.toList treeValues))
+      ++ map showVal (Map.toList treeValues)
     where
-      m (name, _) = "{- mod " ++ name ++ " -}"
+      u path = "use " ++ show path
+      m (name, rest) = "mod " ++ name ++ "\n" ++ indent2 (show rest)
+
+indent2 :: String -> String
+indent2 = intercalate "\n" . map ("  " ++) . lines
+
+instance Show UsePath where
+  show UseAll = "_"
+  show (UseMember name) = name
+  show (UseModule name [rest]) = name ++ "." ++ show rest
+  show (UseModule name rest) =
+    name ++ ".(" ++ intercalate ", " (map show rest) ++ ")"
 
 showData :: (String, DataDecl) -> String
 showData (name, DataDecl {..}) =
@@ -140,6 +161,9 @@ showVal (name, val ::: ty) =
 instance Show Name where
   show (Name s) = intercalate "." s
 
+(+++) :: Name -> Name -> Name
+(+++) (Name a) (Name b) = Name (a ++ b)
+
 (...) :: Name -> String -> Name
 (...) (Name a) b = Name (a ++ [b])
 
@@ -151,8 +175,11 @@ instance Show Name where
 
 type SerializedTree = (Env DataDecl, Env (Typed Expr))
 
-treeCollect :: ModuleTree -> SerializedTree
-treeCollect m = treeCollect' (Name []) m ([], [])
+pattern InternalRoot :: String
+pattern InternalRoot = "Internal"
+
+treeCollect :: String -> ModuleTree -> SerializedTree
+treeCollect package m = treeCollect' (Name [package]) m ([], [])
 
 treeCollect' :: Name -> ModuleTree -> SerializedTree -> SerializedTree
 treeCollect' name ModuleTree {..} (datas, values) =
@@ -171,7 +198,8 @@ isGeneric _ = True
 
 emptyModule :: ModuleTree
 emptyModule = ModuleTree
-  { treeModules = Map.empty,
+  { treeImports = [],
+    treeModules = Map.empty,
     treeDatas = Map.empty,
     treeValues = Map.empty }
 
@@ -180,6 +208,10 @@ uniqueInsert e k v m
   | k `Map.member` m = Left e
   | otherwise = Right (Map.insert k v m)
 
+addUseDecls :: [UsePath] -> ModuleTree -> ModuleTree
+addUseDecls path ModuleTree {..} = ModuleTree
+  { treeImports = path ++ treeImports, .. }
+
 addSubModule :: String -> ModuleTree -> ModuleTree -> Either String ModuleTree
 addSubModule name m ModuleTree {..} = do
   new <- uniqueInsert err name m treeModules
@@ -187,19 +219,29 @@ addSubModule name m ModuleTree {..} = do
   where
     err = "multipe submodules with name: " ++ show name
 
-addDataDecl :: String -> DataDecl -> ModuleTree -> Either String ModuleTree
-addDataDecl name data' ModuleTree {..} = do
-  new <- uniqueInsert err name data' treeDatas
-  return ModuleTree { treeDatas = new, .. }
+addDataDecl :: Name -> String -> DataDecl -> ModuleTree -> Either String ModuleTree
+addDataDecl path name data' ModuleTree {..} = do
+  datas <- uniqueInsert err name data' treeDatas
+  vals <- iterCons treeValues $ constructorsForData (path...name) data'
+  return ModuleTree
+    { treeDatas = datas,
+      treeValues = vals,
+      .. }
   where
-    err = "data type defined multiple times in module: " ++ show name
+    err = "data type defined multiple times: " ++ show name
+    iterCons vals [] = Right vals
+    iterCons vals ((name, expr):rest) = do
+      vals' <- uniqueInsert err name expr vals
+      iterCons vals' rest
+      where
+        err = "constructor clashes with existing value: " ++ show name
 
 addValDecl :: String -> Typed Expr -> ModuleTree -> Either String ModuleTree
 addValDecl name val ModuleTree {..} = do
   new <- uniqueInsert err name val treeValues
   return ModuleTree { treeValues = new, .. }
   where
-    err = "value defined multiple times in module: " ++ show name
+    err = "value defined multiple times: " ++ show name
 
 replaceSubModule :: String -> ModuleTree -> ModuleTree -> ModuleTree
 replaceSubModule name m ModuleTree {..} = ModuleTree
@@ -213,12 +255,12 @@ replaceValDecl :: String -> Typed Expr -> ModuleTree -> ModuleTree
 replaceValDecl name val ModuleTree {..} = ModuleTree
   { treeValues = Map.insert name val treeValues, .. }
 
-constructorsForData :: (Name, DataDecl) -> Env (Typed Expr)
-constructorsForData (name, DataDecl {..}) = map constructorFor variants
+constructorsForData :: Name -> DataDecl -> [(String, Typed Expr)]
+constructorsForData name DataDecl {..} = map constructorFor variants
   where
-    constructorFor (vname, []) = (name.|.vname, Val (Cons name vname []) ::: ty)
+    constructorFor (vname, []) = (vname, Val (Cons name vname []) ::: ty)
     constructorFor (vname, types) =
-      (name.|.vname, (Val $ Func names $ ICons name vname exprs ::: ty) ::: fty)
+      (vname, (Val $ Func names $ ICons name vname exprs ::: ty) ::: fty)
       where
         names = zipWith (:::) allNames types
         exprs = zipWith idFor allNames types
@@ -227,12 +269,6 @@ constructorsForData (name, DataDecl {..}) = map constructorFor variants
     ty = foldl' TApp (TId name) tvars
     tvars = map TVar typeParams
     allNames = for [0..] $ \x -> Name ["p" ++ show x]
-
-constructorTypesForData :: (Name, DataDecl) -> Env Type
-constructorTypesForData (name, DataDecl {..}) = map typeFor variants
-  where
-    typeFor (vname, types) = (name.|.vname, mkFuncTy types ty)
-    ty = foldl' TApp (TId name) $ map TVar typeParams
 
 constructorPatternsForData :: (Name, DataDecl) -> Env (Type, [Type])
 constructorPatternsForData (name, DataDecl {..}) = map patFor variants
@@ -316,7 +352,7 @@ countLocals (expr ::: _) env =
       foldr ($) env $ map countLocals list
   where
     addName name [] = []
-    addName name ((e@(n, x)) : xs)
+    addName name (e@(n, x) : xs)
       | n == name = (n, x+1) : xs
       | otherwise = e : addName name xs
 
@@ -375,7 +411,7 @@ substitute name value (expr ::: ty) =
       App (substitute name value a) (substitute name value b)
     If i t e ->
       If (substitute name value i) (substitute name value t) (substitute name value e)
-    Let (t@(n ::: _)) v expr
+    Let t@(n ::: _) v expr
       | n == name -> Let t (substitute name value v) expr
       | otherwise -> Let t (substitute name value v) (substitute name value expr)
     Match exprs cases ->
@@ -445,7 +481,7 @@ mkFuncTy [] r = r
 mkFuncTy (x:xs) r = TFunc x (mkFuncTy xs r)
 
 tIdVar :: Name -> Type
-tIdVar (name@(Name [s])) =
+tIdVar name@(Name [s]) =
   if isCap $ head s then
     TId name
   else
@@ -453,7 +489,7 @@ tIdVar (name@(Name [s])) =
 tIdVar name = TId name
 
 pIdVar :: Name -> Pattern
-pIdVar (name@(Name [s])) =
+pIdVar name@(Name [s]) =
   if isCap $ head s then
     PCons name []
   else
@@ -476,8 +512,11 @@ lookup' name xs = go xs
       | n == name = x
       | otherwise = go xs
 
+pattern EmptyName :: Name
+pattern EmptyName = Name []
+
 pattern Internal :: String -> Name
-pattern Internal s = Name [{-"Internal",-} s]
+pattern Internal s = Name [InternalRoot, s]
 
 pattern TUnit :: Type
 pattern TUnit = TId (Internal "Unit")

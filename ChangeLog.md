@@ -1,4 +1,4 @@
-# Revision history for birch
+# Revision history for boat
 
 ## 0.1.0.0  -- YYYY-mm-dd
 

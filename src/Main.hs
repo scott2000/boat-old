@@ -4,6 +4,7 @@ module Main where
 
 import AST
 import Parser
+import NameResolve
 import Infer
 import Run
 import Compile
@@ -28,10 +29,11 @@ main = do
   args <- getArgs
   case args of
     [] -> startRepl
-    [path] -> startCompile path
+    [path] -> startCompile path "Pack"
+    [path, package] -> startCompile path package
     other -> do
       putStrLn ("too many arguments: " ++ unwords other)
-      putStrLn "expected either a file name or nothing"
+      putStrLn "Usage: boat [<file> [package]]"
 
 findNamed :: Name -> Env (Typed a) -> Either String (Typed Name)
 findNamed name env =
@@ -41,33 +43,38 @@ findNamed name env =
       | isGeneric ty -> Left ("type of entry point `" ++ show name ++ "` is not concrete: " ++ show ty)
       | otherwise -> Right (name ::: ty)
 
-startCompile :: String -> IO ()
-startCompile path = do
+startCompile :: String -> String -> IO ()
+startCompile path package = do
   header path
   file <- readFile path
   putStr $ dropWhile ('\n' ==) file
-  header "parsed"
-  let parser = runCustomParser 0 moduleParser
+  header "parse"
+  let parser = runCustomParser 0 $ moduleParser (Name [package]) emptyModule
   case runParser parser path file of
     Left err -> putStr (errorFmt ++ "syntax error: " ++ reset ++ errorBundlePretty err) >> flushOut >> exitFailure
     Right (tree, nextAnon) -> do
       putStrLn $ show $ tree
-      header "inferred"
-      let (datas, values) = treeCollect tree
-      case inferAll nextAnon datas values of
+      header "name resolve"
+      case nameResolveAll package tree of
         Left err -> printerr err
-        Right (inferred, _) -> do
-          putStr $ unlines $ for inferred $ \(n, _ ::: ty) -> show n ++ " : " ++ show ty
-          header "evaluate"
-          case findNamed (Name ["main"]) inferred of
+        Right tree -> do
+          putStrLn $ show $ tree
+          header "infer"
+          let (datas, values) = treeCollect package tree
+          case inferAll nextAnon datas values of
             Left err -> printerr err
-            Right name ->
-              case evaluateEntry name inferred datas of
+            Right (inferred, _) -> do
+              putStr $ unlines $ for inferred $ \(n, _ ::: ty) -> show n ++ " : " ++ show ty
+              header "evaluate"
+              case findNamed (Name [package, "main"]) inferred of
                 Left err -> printerr err
-                Right (mainVal, runMap) -> do
-                  putStrLn (show mainVal ++ " : " ++ show (typeof mainVal))
-                  header "compiled"
-                  compile path mainVal runMap datas 64
+                Right name ->
+                  case evaluateEntry name inferred of
+                    Left err -> printerr err
+                    Right (mainVal, runMap) -> do
+                      putStrLn (show mainVal ++ " : " ++ show (typeof mainVal))
+                      header "compile"
+                      compile path mainVal runMap datas 64
   where
     printerr err = putStrLn (errorFmt ++ "error: " ++ reset ++ err) >> exitFailure
     header x = putStrLn ("\n-- " ++ x ++ " --\n")
@@ -80,6 +87,7 @@ data ReplState = ReplState
     replNextExpr :: Word64,
     replSetInfo :: Bool,
     replFirst :: Bool,
+    replImports :: [UsePath],
     replDatas :: Map.Map Name DataDecl,
     replValues :: Map.Map Name (Typed Expr) }
 
@@ -87,6 +95,7 @@ data ReplResult
   = Quit
   | Ignore
   | Reset
+  | DeclareUse [UsePath]
   | DeclareVal (String, Typed Expr)
   | DeclareData (String, DataDecl)
   | Eval (Typed Expr)
@@ -97,6 +106,7 @@ defaultRepl = ReplState
     replNextExpr = 0,
     replSetInfo = False,
     replFirst = True,
+    replImports = [],
     replDatas = Map.empty,
     replValues = Map.empty }
 
@@ -131,6 +141,7 @@ promptFmt = F.setSGRCode
 dullBlue = F.setSGRCode
   [ F.SetColor F.Foreground F.Dull F.Blue ]
 
+-- TODO reimplement repl to support modules
 repl :: Repl ()
 repl = go ""
   where
@@ -184,6 +195,9 @@ repl = go ""
                   Reset -> do
                     put defaultRepl
                     repl
+                  DeclareUse us -> do
+                    modify $ \s -> s { replImports = us ++ replImports s, replFirst = False }
+                    outputError "use declarations in repl are not yet implemented"
                   DeclareVal (name, val)
                     | invalidName name ->
                       outputError ("cannot declare value with name `" ++ name ++ "`, try `result" ++ drop 3 name ++ "` instead")
@@ -191,7 +205,16 @@ repl = go ""
                       modify $ \s -> s { replValues = Map.insert (Name [name]) val (replValues s), replFirst = False }
                       repl
                   DeclareData (name, data') -> do
-                    modify $ \s -> s { replDatas = Map.insert (Name [name]) data' (replDatas s), replFirst = False }
+                    modify $ \s ->
+                      let
+                        dataName = Name [name]
+                        insertAll [] m = m
+                        insertAll ((n, x):xs) m =
+                          insertAll xs $ Map.insert (Name [n]) x m
+                      in s
+                        { replDatas = Map.insert dataName data' (replDatas s),
+                          replValues = insertAll (constructorsForData dataName data') $ replValues s,
+                          replFirst = False }
                     repl
                   Eval expr -> do
                     ReplState {..} <- get
@@ -199,13 +222,14 @@ repl = go ""
                       resName = Name [replRes]
                       dataDecls = Map.toList replDatas
                       valDecls = (resName, expr) : Map.toList replValues
+                    -- TODO name resolution
                     case inferAll replNextAnon dataDecls valDecls of
                       Left err -> outputError err
                       Right (inferred, newAnon) ->
                         case findNamed resName inferred of
                           Left err -> outputError err
                           Right typedName ->
-                            case evaluateEntry typedName inferred dataDecls of
+                            case evaluateEntry typedName inferred of
                               Left err -> outputError err
                               Right (evaluated, _) -> do
                                 let
@@ -261,7 +285,11 @@ iterRepl string = do
       return state
 
 parseRepl :: Word64 -> Parser ReplResult
-parseRepl n = DeclareVal <$> parseReplVal n <|> DeclareData <$> dataDeclParser <|> Eval <$> parseReplExpr n
+parseRepl n =
+  DeclareUse <$> useDeclParser
+  <|> DeclareVal <$> parseReplVal n
+  <|> DeclareData <$> dataDeclParser
+  <|> Eval <$> parseReplExpr n
 
 parseReplVal :: Word64 -> Parser (String, Typed Expr)
 parseReplVal 0 = valDeclParser
@@ -301,9 +329,10 @@ parseCommands commands =
       ReplState {..} <- get
       let
         showFst (a, b) = (show a, b)
-        datas = unlines $ map (showData . showFst) $ Map.toList replDatas
-        values = unlines $ map (showVal . showFst) $ Map.toList replValues
-      lift $ outputStrLn (datas ++ values)
+        imports = map (("use " ++) . show) replImports
+        datas = map (showData . showFst) $ Map.toList replDatas
+        values = map (showVal . showFst) $ Map.toList replValues
+      lift $ outputStrLn $ unlines (imports ++ datas ++ values)
       return Ignore
     ("info", "on") -> setInfo $ const True
     ("info", "off") -> setInfo $ const False

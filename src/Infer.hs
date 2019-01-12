@@ -52,7 +52,7 @@ inferAll count dataDecls valDecls = do
   let red = removeRedundancies grouped
   let sorted = tsort red
   let values = map (flip getAllValues valDecls) sorted
-  let valueConstructors = Map.fromList $ concat $ map constructorTypesForData dataDecls
+  let valueConstructors = Map.empty -- TODO: replace this with globals from other modules
   let patternConstructors = Map.fromList $ concat $ map constructorPatternsForData dataDecls
   (inferred, count) <- inferEach count values valueConstructors [] patternConstructors
   quantified <- sequence $ map (quantifyVerify 0) inferred
@@ -301,25 +301,39 @@ instance TypeMap Name where
   getLocals _ = return ()
 
 instance TypeMap Expr where
-  mapTypes f (Val v) = Val (mapTypes f v)
-  mapTypes f (Op op a b) = Op op (mapTypes f a) (mapTypes f b)
-  mapTypes f (App a b) = App (mapTypes f a) (mapTypes f b)
-  mapTypes f (If i t e) = If (mapTypes f i) (mapTypes f t) (mapTypes f e)
-  mapTypes f (Let name val expr) = Let (mapTypes f name) (mapTypes f val) (mapTypes f expr)
-  mapTypes f (Match exprs cases) = Match (map (mapTypes f) exprs) $ map mapCase cases
-    where mapCase (pats, expr) = (map (mapTypes f) pats, mapTypes f expr)
-  mapTypes f (ICons name variant list) = ICons name variant $ for list $ mapTypes f
-  mapTypes _ other = other
+  mapTypes f x =
+    case x of
+      Val v ->
+        Val (mapTypes f v)
+      Op op a b ->
+        Op op (mapTypes f a) (mapTypes f b)
+      App a b ->
+        App (mapTypes f a) (mapTypes f b)
+      If i t e ->
+        If (mapTypes f i) (mapTypes f t) (mapTypes f e)
+      Let name val expr ->
+        Let (mapTypes f name) (mapTypes f val) (mapTypes f expr)
+      Match exprs cases ->
+        Match (map (mapTypes f) exprs) $ for cases $ \(pats, expr) ->
+          (map (mapTypes f) pats, mapTypes f expr)
+      ICons name variant list ->
+        ICons name variant $ for list $ mapTypes f
+      other -> other
 
-  verifyTypes (Val v) = verifyTypes v
-  verifyTypes (Op _ a b) = verifyTypes a >> verifyTypes b
-  verifyTypes (App a b) = verifyTypes a >> verifyTypes b
-  verifyTypes (If i t e) = verifyTypes i >> verifyTypes t >> verifyTypes e
-  verifyTypes (Let name val expr) = verifyTypes name >> verifyTypes val >> verifyTypes expr
-  verifyTypes (Match exprs cases) = sequence_ (map verifyTypes exprs) >> sequence_ (map verifyCase cases)
-    where verifyCase (pats, expr) = verifyTypes expr >> sequence_ (map verifyTypes pats)
-  verifyTypes (ICons _ _ list) = sequence_ $ map verifyTypes list
-  verifyTypes _ = Right ()
+  verifyTypes x =
+    case x of
+      Val v -> verifyTypes v
+      Op _ a b -> verifyTypes a >> verifyTypes b
+      App a b -> verifyTypes a >> verifyTypes b
+      If i t e -> verifyTypes i >> verifyTypes t >> verifyTypes e
+      Let name val expr -> verifyTypes name >> verifyTypes val >> verifyTypes expr
+      Match exprs cases -> do
+        sequence_ $ map verifyTypes exprs
+        sequence_ $ for cases $ \(pats, expr) -> do
+          verifyTypes expr
+          sequence_ $ map verifyTypes pats
+      ICons _ _ list -> sequence_ $ map verifyTypes list
+      _ -> Right ()
 
   getLocals x =
     case x of
