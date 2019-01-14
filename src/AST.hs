@@ -133,7 +133,9 @@ instance Show ModuleTree where
       ++ map showVal (Map.toList treeValues)
     where
       u path = "use " ++ show path
-      m (name, rest) = "mod " ++ name ++ "\n" ++ indent2 (show rest)
+      m (name, rest)
+        | isModuleEmpty rest = "mod " ++ name
+        | otherwise = "mod " ++ name ++ " =\n" ++ indent2 (show rest)
 
 indent2 :: String -> String
 indent2 = intercalate "\n" . map ("  " ++) . lines
@@ -203,6 +205,13 @@ emptyModule = ModuleTree
     treeDatas = Map.empty,
     treeValues = Map.empty }
 
+isModuleEmpty :: ModuleTree -> Bool
+isModuleEmpty ModuleTree {..} =
+  null treeImports
+  && Map.null treeModules
+  && Map.null treeDatas
+  && Map.null treeValues
+
 uniqueInsert :: Ord k => e -> k -> v -> Map.Map k v -> Either e (Map.Map k v)
 uniqueInsert e k v m
   | k `Map.member` m = Left e
@@ -211,13 +220,6 @@ uniqueInsert e k v m
 addUseDecls :: [UsePath] -> ModuleTree -> ModuleTree
 addUseDecls path ModuleTree {..} = ModuleTree
   { treeImports = path ++ treeImports, .. }
-
-addSubModule :: String -> ModuleTree -> ModuleTree -> Either String ModuleTree
-addSubModule name m ModuleTree {..} = do
-  new <- uniqueInsert err name m treeModules
-  return ModuleTree { treeModules = new, .. }
-  where
-    err = "multipe submodules with name: " ++ show name
 
 addDataDecl :: Name -> String -> DataDecl -> ModuleTree -> Either String ModuleTree
 addDataDecl path name data' ModuleTree {..} = do

@@ -1,5 +1,3 @@
-{-# LANGUAGE RecordWildCards #-}
-
 module Infer (inferAll, simplify, TypeMap (mapTypes)) where
 
 import AST

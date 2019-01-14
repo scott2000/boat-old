@@ -1,4 +1,4 @@
-{-# LANGUAGE RecordWildCards, NamedFieldPuns, LambdaCase #-}
+{-# LANGUAGE RecordWildCards, NamedFieldPuns #-}
 
 module Verify where
 

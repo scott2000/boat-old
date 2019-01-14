@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleInstances, NamedFieldPuns #-}
+{-# LANGUAGE FlexibleInstances, NamedFieldPuns, RecordWildCards #-}
 
 module Parser where
 import AST
@@ -12,9 +12,10 @@ import Text.Megaparsec hiding (State)
 import Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
 import qualified Data.Set as Set
+import qualified Data.Map as Map
 
--- The minimum possible indentation and whether to parse newlines
-type LinePosition = (Int, Bool)
+-- The minimum possible indentation, whether to parse newlines, and whether extra indentation is allowed
+type LinePosition = (Int, Bool, Bool)
 
 -- The number of anonymous types assigned
 type AnonCount = Word64
@@ -23,7 +24,7 @@ type MParser = Parsec Void String
 type Parser = ReaderT LinePosition (StateT AnonCount MParser)
 
 runCustomParser :: AnonCount -> Parser a -> MParser (a, AnonCount)
-runCustomParser c p = runStateT (runReaderT (followedByEnd p) (0, True)) c
+runCustomParser c p = runStateT (runReaderT (followedByEnd p) (0, True, False)) c
 
 followedByEnd :: Parser a -> Parser a
 followedByEnd p = do
@@ -32,20 +33,26 @@ followedByEnd p = do
   return res
 
 blockOf :: Parser a -> Parser a
-blockOf p = do
+blockOf = blockAllowingOf True
+
+strictBlockOf :: Parser a -> Parser a
+strictBlockOf = blockAllowingOf False
+
+blockAllowingOf :: Bool -> Parser a -> Parser a
+blockAllowingOf allow p = do
   newLine <- anySpaceChunk
-  current <- fst <$> ask
+  (current, _, _) <- ask
   if newLine then do
     level <- (subtract 1 . unPos) <$> L.indentLevel
     if level < current then
       fail ("block indented less then containing block (" ++ show level ++ " < " ++ show current ++ ")")
     else
-      withLinePos (level, True) p
+      withLinePos (level, True, allow) p
   else
-    withLinePos (current, False) p
+    withLinePos (current, False, allow) p
 
 anyIndent :: Parser a -> Parser a
-anyIndent = withLinePos (0, True)
+anyIndent = withLinePos (0, True, True)
 
 withLinePos :: LinePosition -> Parser a -> Parser a
 withLinePos pos p = lift $ runReaderT p pos
@@ -60,26 +67,31 @@ keywords = ["use", "mod", "data", "val", "let", "match", "in", "unit", "true", "
 
 moduleParser :: Name -> ModuleTree -> Parser ModuleTree
 moduleParser path current =
-  symbol (use <|> module' <|> data' <|> value <|> return current)
+  try (symbol (use <|> module' <|> data' <|> value)) <|> return current
   where
     use = do
       paths <- useDeclParser
       moduleParser path $ addUseDecls paths current
+    module' = modDeclParser path current
     p parser add = do
       (name, val) <- parser
       case add name val current of
         Right new -> moduleParser path new
         Left err -> fail err
-    module' = p (modDeclParser path) addSubModule
-    data' = p dataDeclParser (addDataDecl path)
+    data' = p dataDeclParser $ addDataDecl path
     value = p valDeclParser addValDecl
 
-modDeclParser :: Name -> Parser (String, ModuleTree)
-modDeclParser path = label "mod declaration" $ do
+modDeclParser :: Name -> ModuleTree -> Parser ModuleTree
+modDeclParser path ModuleTree {..} = label "mod declaration" $ do
   try $ key "mod"
-  name <- anyIndent identifier
-  m <- blockOf $ moduleParser (path...name) emptyModule
-  return (name, m)
+  name <- anyIndent $ identifier
+  let sub = Map.findWithDefault emptyModule name treeModules
+  sub' <- defined name sub <|> return sub
+  moduleParser path ModuleTree { treeModules = Map.insert name sub' treeModules, .. }
+  where
+    defined name sub = do
+      try $ anyIndent $ symbol $ char '='
+      strictBlockOf $ moduleParser (path...name) sub
 
 useDeclParser :: Parser [UsePath]
 useDeclParser = label "use declaration" $ do
@@ -110,7 +122,7 @@ valDeclParser = label "val declaration" $ do
   (name, ty) <- anyIndent $ do
     name <- identifier
     ty <- parseAscription
-    symbol $ string "="
+    symbol $ char '='
     return (name, ty)
   expr <- blockOf parser
   (,) name <$> ascribe expr ty
@@ -121,7 +133,7 @@ dataDeclParser = label "data declaration" $ do
   (name, tp) <- anyIndent $ do
     (name, typeParams) <- variant
     tp <- sequence $ map into typeParams
-    symbol $ string "="
+    symbol $ char '='
     return (name, tp)
   variants <- blockOf (multiline <|> singleline)
   return (name, DataDecl { typeParams = tp, variants })
@@ -129,10 +141,10 @@ dataDeclParser = label "data declaration" $ do
     into (TVar s) = return s
     into other = fail ("data declaration expected type variables, found other type: " ++ show other)
     multiline = do
-      try $ symbol $ string "|"
+      try $ symbol $ char '|'
       singleline
     manyVariants = many $ do
-      try $ symbol $ string "|"
+      try $ symbol $ char '|'
       variant
     singleline = (:) <$> variant <*> manyVariants
 
@@ -229,22 +241,28 @@ whitespace = void $ takeWhile1P Nothing isSpace
     isSpace _    = False
 
 indentedNewline :: Parser ()
-indentedNewline = try $ do
-  (minIndent, allow) <- ask
-  if allow then do
-    char '\n'
-    parseSpaces minIndent minIndent
+indentedNewline = do
+  (minIndent, newline, allow) <- ask
+  if newline then do
+    try $ char '\n'
+    parseSpaces allow minIndent
   else
     fail "newline not allowed here"
 
-parseSpaces :: Int -> Int -> Parser ()
-parseSpaces _        0 = return ()
-parseSpaces original n = token test Set.empty >>= id
+parseSpaces :: Bool -> Int -> Parser ()
+parseSpaces allow minIndent = go 0
   where
-    test ' '  = Just $ parseSpaces original $ n-1
-    test '\n' = Just $ parseSpaces original original
-    test '\r' = Just $ parseSpaces original n
-    test _    = Nothing
+    go :: Int -> Parser ()
+    go n = (token cont Set.empty >>= id) <|> stop
+      where
+        cont ' '  = Just $ go (n+1)
+        cont '\n' = Just $ go 0
+        cont '\r' = Just $ go n
+        cont _    = Nothing
+        stop
+          | n == minIndent || (allow && n > minIndent) = return ()
+          | otherwise =
+            fail ("expected indent of " ++ show minIndent ++ ", found " ++ show n)
 
 spaceChunk :: Parser ()
 spaceChunk = choice [whitespace, indentedNewline, lineCmnt, blockCmnt]
@@ -268,7 +286,7 @@ sc' = hidden $ skipMany spaceChunk
 function :: Parser Expr
 function = do
   try $ symbol $ (char '\\' <|> char '\x3bb')
-  cases <- blockOf $ some $ matchCase
+  cases <- strictBlockOf $ some $ matchCase
   case cases of
     [(pats, expr)] ->
       case names pats of
@@ -309,7 +327,7 @@ matchbinding :: Parser Expr
 matchbinding = do
   try $ symbol $ key "match"
   exprs <- anyIndent someExprs
-  cases <- blockOf $ some $ parseCase $ length exprs
+  cases <- strictBlockOf $ some $ parseCase $ length exprs
   return $ Match exprs cases
   where
     parseCase len = do
@@ -330,7 +348,7 @@ matchCase = do
     somePatterns = do
       p <- symbol $ parserNoSpace
       (p:) <$> manyPatterns
-    manyPatterns = symbol $ (try (string "->" >> return []) <|> somePatterns)
+    manyPatterns = symbol $ ((string "->" >> return []) <|> somePatterns)
 
 ifThenElse :: Parser Expr
 ifThenElse = do
