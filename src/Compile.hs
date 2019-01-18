@@ -42,6 +42,7 @@ import qualified Data.Map as Map
 
 Current Goals:
 
+- add set-based verification (keep track of what has been used)
 - reimplement repl
 - data modules (constructors in separate module, module extension)
 - add `rec` keyword for tail recursion

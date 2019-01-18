@@ -249,7 +249,7 @@ parseSpaces :: Bool -> Int -> Parser ()
 parseSpaces allow minIndent = go 0
   where
     go :: Int -> Parser ()
-    go n = (token cont Set.empty >>= id) <|> stop
+    go n = ((lineCmnt <|> blockCmnt) >> go 0) <|> (token cont Set.empty >>= id) <|> stop
       where
         cont ' '  = Just $ go (n+1)
         cont '\n' = Just $ go 0

@@ -14,6 +14,11 @@ data VPattern
 instance Show VPattern where
   show VAny = "_"
   show (VCons n []) = show n
+  show (VCons (Name ["1 +"]) [x]) = iterplus 1 x
+    where
+      iterplus n VAny = ">" ++ show (n-1)
+      iterplus n (VCons (Name ["0"]) []) = show n
+      iterplus n (VCons (Name ["1 +"]) [x]) = iterplus (n+1) x
   show (VCons n pats) = "(" ++ intercalate " " (show n : map show pats) ++ ")"
 
 defaultVPats :: Int -> [VPattern]
