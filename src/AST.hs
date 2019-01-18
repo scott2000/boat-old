@@ -133,9 +133,7 @@ instance Show ModuleTree where
       ++ map showVal (Map.toList treeValues)
     where
       u path = "use " ++ show path
-      m (name, rest)
-        | isModuleEmpty rest = "mod " ++ name
-        | otherwise = "mod " ++ name ++ " =\n" ++ indent2 (show rest)
+      m (name, rest) = "mod " ++ name ++ "\n" ++ indent2 (show rest)
 
 indent2 :: String -> String
 indent2 = intercalate "\n" . map ("  " ++) . lines

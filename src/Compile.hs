@@ -29,6 +29,8 @@ import LLVM.PassManager (PassSetSpec (..), defaultCuratedPassSetSpec, withPassMa
 
 import LLVM.Pretty
 
+import System.FilePath
+
 import Data.Word
 import Data.List
 import Data.String
@@ -40,8 +42,7 @@ import qualified Data.Map as Map
 
 Current Goals:
 
-- multiple files for modules
-- repl support for modules (reimplement?)
+- reimplement repl
 - data modules (constructors in separate module, module extension)
 - add `rec` keyword for tail recursion
 - better error handling
@@ -151,18 +152,16 @@ inLet builder namef = do
   modify $ \s -> s { getFunctionName = name }
   return r
 
-compile :: String -> Typed Value -> RunMap -> Env DataDecl -> Word32 -> IO ()
-compile path mainVal runMap datas wordSize =do
+compile :: FilePath -> Typed Value -> RunMap -> Env DataDecl -> Word32 -> IO ()
+compile boatPath mainVal runMap datas wordSize = do
   let
-    m = buildModule "test"
+    (boatDir, boatFile) = splitFileName boatPath
+    boatName = dropExtension boatFile
+    path = boatDir </> "out" </> boatName
+    m = buildModule (fromString boatName)
       $ evalStateT (genMain mainVal)
       $ newCodegen runMap datas wordSize
-    replaceExtension ext = reverse . r . reverse
-      where
-        r []       = []
-        r ('.':xs) = reverse ext ++ "." ++ xs
-        r (x  :xs) = r xs
-    ofile = File (replaceExtension "o" path)
+    ofile = File (path <.> "o")
   putStrLn $ unpack $ ppllvm m
   withContext $ \c ->
     withModuleFromAST c m $ \cm ->
@@ -176,7 +175,7 @@ compile path mainVal runMap datas wordSize =do
         withPassManager spec $ \pm -> runPassManager pm cm
         writeObjectToFile tm ofile cm
         mm <- moduleAST cm
-        writeFile (replaceExtension "ll" path) $ unpack $ ppllvm mm
+        writeFile (path <.> "ll") $ unpack $ ppllvm mm
 
 genMain :: Typed Value -> BuilderState Operand
 genMain mainVal = do

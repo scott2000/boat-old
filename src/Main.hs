@@ -12,7 +12,8 @@ import Compile
 import qualified System.Console.ANSI as F
 
 import System.Console.Haskeline
-
+import System.FilePath
+import System.Directory
 import System.IO (hFlush, stdout, readFile)
 import System.Exit (exitFailure)
 import System.Environment (getArgs)
@@ -29,11 +30,10 @@ main = do
   args <- getArgs
   case args of
     [] -> startRepl
-    [path] -> startCompile path "Pack"
-    [path, package] -> startCompile path package
+    [path] -> startCompile path
     other -> do
       putStrLn ("too many arguments: " ++ unwords other)
-      putStrLn "Usage: boat [<file> [package]]"
+      putStrLn "Usage: boat [file]"
 
 findNamed :: Name -> Env (Typed a) -> Either String (Typed Name)
 findNamed name env =
@@ -43,41 +43,100 @@ findNamed name env =
       | isGeneric ty -> Left ("type of entry point `" ++ show name ++ "` is not concrete: " ++ show ty)
       | otherwise -> Right (name ::: ty)
 
-startCompile :: String -> String -> IO ()
-startCompile path package = do
-  header path
-  file <- readFile path
-  putStr $ dropWhile ('\n' ==) file
+startCompile :: FilePath -> IO ()
+startCompile path = do
   header "parse"
-  let parser = runCustomParser 0 $ moduleParser (Name [package]) emptyModule
-  case runParser parser path file of
-    Left err -> putStr (errorFmt ++ "syntax error: " ++ reset ++ errorBundlePretty err) >> flushOut >> exitFailure
-    Right (tree, nextAnon) -> do
+  assertOrFail (isValid path) ("invalid path: " ++ path)
+  let (dirPath, extension) = splitExtension path
+  assertOrFail (extension == ".boat") ("expected an extension of .boat, found " ++ extension)
+  let package = takeBaseName dirPath
+  assertOrFail (isValidName package) ("invalid package name: " ++ package)
+  let parseModules = compileStep package dirPath (Name [package])
+  (tree, nextAnon) <- execStateT parseModules (emptyModule, 0)
+  header "tree"
+  putStrLn $ show $ tree
+  header "name resolve"
+  case nameResolveAll package tree of
+    Left err -> printerr err
+    Right tree -> do
       putStrLn $ show $ tree
-      header "name resolve"
-      case nameResolveAll package tree of
+      header "infer"
+      let (datas, values) = treeCollect package tree
+      case inferAll nextAnon datas values of
         Left err -> printerr err
-        Right tree -> do
-          putStrLn $ show $ tree
-          header "infer"
-          let (datas, values) = treeCollect package tree
-          case inferAll nextAnon datas values of
+        Right (inferred, _) -> do
+          putStr $ unlines $ for inferred $ \(n, _ ::: ty) -> show n ++ " : " ++ show ty
+          header "evaluate"
+          case findNamed (Name [package, "main"]) inferred of
             Left err -> printerr err
-            Right (inferred, _) -> do
-              putStr $ unlines $ for inferred $ \(n, _ ::: ty) -> show n ++ " : " ++ show ty
-              header "evaluate"
-              case findNamed (Name [package, "main"]) inferred of
+            Right name ->
+              case evaluateEntry name inferred of
                 Left err -> printerr err
-                Right name ->
-                  case evaluateEntry name inferred of
-                    Left err -> printerr err
-                    Right (mainVal, runMap) -> do
-                      putStrLn (show mainVal ++ " : " ++ show (typeof mainVal))
-                      header "compile"
-                      compile path mainVal runMap datas 64
+                Right (mainVal, runMap) -> do
+                  putStrLn (show mainVal ++ " : " ++ show (typeof mainVal))
+                  header "compile"
+                  compile path mainVal runMap datas 64
+
+compileStep :: String -> FilePath -> Name -> StateT (ModuleTree, AnonCount) IO ()
+compileStep package dirPath name = do
+  lift $ putStrLn $ show name
+  let path = dirPath <.> "boat"
+  fileExists <- lift $ doesFileExist path
+  lift $ assertOrFail fileExists ("cannot find source file: " ++ path)
+  file <- lift $ readFile path
+  (tree, nextAnon) <- get
+  let parser = runCustomParser nextAnon $ moduleParser name tree
+  case runParser parser path file of
+    Left err ->
+      let msg = errorFmt ++ "syntax error: " ++ reset ++ errorBundlePretty err in
+      lift (putStr msg >> flushOut >> exitFailure)
+    Right new -> do
+      put new
+      dirExists <- lift $ doesDirectoryExist dirPath
+      if dirExists then do
+        files <- lift $ listDirectory dirPath
+        sequence_ $ for files $ \file ->
+          let (subName, extension) = splitExtension file in
+          if extension /= ".boat" then return () else do
+          lift $ assertOrFail (isValidName subName) ("invalid module name: " ++ subName)
+          let parseModules = compileStep package (dirPath </> subName) (name...subName)
+          (ModuleTree {..}, nextAnon) <- get
+          let sub = Map.findWithDefault emptyModule subName treeModules
+          (sub', nextAnon) <- lift $ execStateT parseModules (sub, nextAnon)
+          put (ModuleTree { treeModules = Map.insert subName sub' treeModules, .. }, nextAnon)
+      else
+        return ()
+
+assertOrFail :: Bool -> String -> IO ()
+assertOrFail True _ = return ()
+assertOrFail False err = printerr err
+
+isValidName :: String -> Bool
+isValidName [] = False
+isValidName (first:rest) = isAlpha first && all isAlphaNum rest
   where
-    printerr err = putStrLn (errorFmt ++ "error: " ++ reset ++ err) >> exitFailure
-    header x = putStrLn ("\n-- " ++ x ++ " --\n")
+    isAlpha ch = ch `elem` ['A'..'Z'] || ch `elem` ['a'..'z'] || ch == '_'
+    isAlphaNum ch = isAlpha ch || ch `elem` ['0'..'9']
+
+printerr, header :: String -> IO ()
+printerr err = putStrLn (errorFmt ++ "error: " ++ reset ++ err) >> exitFailure
+header x = putStrLn ("\n-- " ++ x ++ " --\n")
+
+green, red, reset, errorFmt, promptFmt, dullBlue :: String
+green = F.setSGRCode [F.SetColor F.Foreground F.Dull F.Green]
+red = F.setSGRCode [F.SetColor F.Foreground F.Dull F.Red]
+reset = F.setSGRCode [F.Reset]
+errorFmt = F.setSGRCode
+  [ F.SetColor F.Foreground F.Vivid F.Red,
+    F.SetConsoleIntensity F.BoldIntensity ]
+promptFmt = F.setSGRCode
+  [ F.SetColor F.Foreground F.Vivid F.Blue,
+    F.SetConsoleIntensity F.BoldIntensity ]
+dullBlue = F.setSGRCode
+  [ F.SetColor F.Foreground F.Dull F.Blue ]
+
+flushOut :: IO ()
+flushOut = hFlush stdout
 
 type Repl = StateT ReplState (InputT IO)
 
@@ -128,18 +187,10 @@ startRepl = do
         autoAddHistory = True }
   runInputT settings $ evalStateT repl defaultRepl
 
-green, red, reset, errorFmt, promptFmt, dullBlue :: String
-green = F.setSGRCode [F.SetColor F.Foreground F.Dull F.Green]
-red = F.setSGRCode [F.SetColor F.Foreground F.Dull F.Red]
-reset = F.setSGRCode [F.Reset]
-errorFmt = F.setSGRCode
-  [ F.SetColor F.Foreground F.Vivid F.Red,
-    F.SetConsoleIntensity F.BoldIntensity ]
-promptFmt = F.setSGRCode
-  [ F.SetColor F.Foreground F.Vivid F.Blue,
-    F.SetConsoleIntensity F.BoldIntensity ]
-dullBlue = F.setSGRCode
-  [ F.SetColor F.Foreground F.Dull F.Blue ]
+repl :: Repl ()
+repl = lift $ outputStrLn (errorFmt ++ "repl is currently disabled" ++ reset ++ "\n")
+
+{-
 
 -- TODO reimplement repl to support modules
 repl :: Repl ()
@@ -380,5 +431,4 @@ consumeSpaces :: String -> String
 consumeSpaces (' ':xs) = consumeSpaces xs
 consumeSpaces other = other
 
-flushOut :: IO ()
-flushOut = hFlush stdout
+-}

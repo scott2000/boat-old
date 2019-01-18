@@ -86,12 +86,8 @@ modDeclParser path ModuleTree {..} = label "mod declaration" $ do
   try $ key "mod"
   name <- anyIndent $ identifier
   let sub = Map.findWithDefault emptyModule name treeModules
-  sub' <- defined name sub <|> return sub
+  sub'<- strictBlockOf $ moduleParser (path...name) sub
   moduleParser path ModuleTree { treeModules = Map.insert name sub' treeModules, .. }
-  where
-    defined name sub = do
-      try $ anyIndent $ symbol $ char '='
-      strictBlockOf $ moduleParser (path...name) sub
 
 useDeclParser :: Parser [UsePath]
 useDeclParser = label "use declaration" $ do
