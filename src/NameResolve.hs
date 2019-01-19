@@ -130,7 +130,7 @@ instance NameResolve Name where
     | head (unname name) `Set.member` rootNames = Right name
     | otherwise =
       case possibleNames name s of
-        [] -> Left ("cannot find `" ++ show name ++ "` in current scope")
+        [] -> Left ("cannot find `" ++ show name ++ "` in current scope\n  locals: " ++ intercalate ", " (map show l))
         [x] -> Right x
         xs -> Left ("ambiguous name `" ++ show name ++ "` could refer to:\n  " ++ intercalate "\n  " (map show xs))
 

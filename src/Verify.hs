@@ -4,22 +4,22 @@ module Verify where
 
 import AST
 
+import Data.Word
 import Data.List
+import qualified Data.Set as Set
 
 data VPattern
   = VAny
+  | VNat (Either (Set.Set Word64) Word64)
   | VCons Name [VPattern]
   deriving (Eq, Ord)
 
 instance Show VPattern where
-  show VAny = "_"
-  show (VCons n []) = show n
-  show (VCons (Name ["1 +"]) [x]) = iterplus 1 x
-    where
-      iterplus n VAny = ">" ++ show (n-1)
-      iterplus n (VCons (Name ["0"]) []) = show n
-      iterplus n (VCons (Name ["1 +"]) [x]) = iterplus (n+1) x
-  show (VCons n pats) = "(" ++ intercalate " " (show n : map show pats) ++ ")"
+  show (VCons (Name n) []) = last n
+  show (VCons (Name n) pats) =
+    "(" ++ last n ++ " " ++ intercalate " " (map show pats) ++ ")"
+  show (VNat (Right n)) = show n
+  show _ = "_"
 
 defaultVPats :: Int -> [VPattern]
 defaultVPats n = replicate n VAny
@@ -101,7 +101,6 @@ verifyExpr datas = ver
         _ -> Right ()
     enumerate :: Type -> Env [VPattern]
     enumerate (TApp a _) = enumerate a
-    enumerate TNat = [(Name ["0"], []), (Name ["1 +"], [VAny])]
     enumerate TBool = [(Name ["false"], []), (Name ["true"], [])]
     enumerate (TId name) =
       let DataDecl {..} = lookup' name datas in
@@ -110,8 +109,18 @@ verifyExpr datas = ver
     go :: [Typed Pattern] -> [VPattern] -> [[VPattern]]
     go [] [] = []
     go ((PAny _ ::: _) : ps) (v:vs) = map (v:) $ go ps vs
-    go ((PNat 0 ::: t) : ps) vs = go (((PCons (Name ["0"]) []) ::: t) : ps) vs
-    go ((PNat n ::: t) : ps) vs = go (((PCons (Name ["1 +"]) [PNat (n-1) ::: t]) ::: t) : ps) vs
+    go ((PNat n ::: t) : ps) allV@(v:vs) =
+      case v of
+        VAny -> try Set.empty
+        VNat (Left s) -> try s
+        VNat (Right x)
+          | x == n -> map (v:) $ go ps vs
+          | otherwise -> [allV]
+      where
+        try s
+          | Set.member n s = [VNat (Left s) : vs]
+          | otherwise =
+             map (VNat (Right n) :) (go ps vs) ++ [VNat (Left $ Set.insert n s) : vs]
     go ((PBool False ::: t) : ps) vs = go (((PCons (Name ["false"]) []) ::: t) : ps) vs
     go ((PBool True ::: t) : ps) vs = go (((PCons (Name ["true"]) []) ::: t) : ps) vs
     go ((PCons n xs ::: ty) : ps) (v:vs) =
@@ -122,9 +131,8 @@ verifyExpr datas = ver
         try :: (Name, [VPattern]) -> [[VPattern]]
         try (name, cs)
           | name == n =
-            case (map (VCons name) $ go xs cs, go ps vs) of
-              ([], r) -> map (VCons name cs :) r
-              (c, []) -> map (: vs) c
-              (c, r) -> (:) <$> c <*> r
+            for (go (xs ++ ps) (cs ++ vs)) $ \pats ->
+              let (f, r) = splitAt (length cs) pats in
+              VCons name f : r
           | otherwise = [VCons name cs : vs]
     go _ vs = [vs]

@@ -42,19 +42,16 @@ import qualified Data.Map as Map
 
 Current Goals:
 
-- add set-based verification (keep track of what has been used)
 - reimplement repl
 - data modules (constructors in separate module, module extension)
 - add `rec` keyword for tail recursion
 - better error handling
 - char, int, float types
 - slices/arrays/strings?
-- nat and bool pattern verification (or add normal constructors and patterns with syntactic sugar)
 - string, list, tuple syntactic sugar
 - compile-time simplification (with gas limit)
 - prefix and suffix operators (use ~ for negation?)
-- replace Unit and Bool with user-defined types (bools currently won't pattern match)
-- name clash resolution (currently undefined behavior in many situations)
+- replace Unit and Bool with user-defined types
 - name resolution based on namespaces (module/data/value)
 - user-defined operators (generalized names)
 - typeclasses and constraints
@@ -767,7 +764,16 @@ printx o = go []
     go [_, _] TArrow = printf "<func>" []
     go [] TUnit = printf "unit" []
     go [] TNat = printf "%llu" [o]
-    go [] TBool = printf "%u" [o]
+    go [] TBool = mdo
+      condBr o thenBlock elseBlock
+      thenBlock <- block `named` "print.then"
+      printf "true" []
+      br endBlock
+      elseBlock <- block `named` "print.else"
+      printf "false" []
+      br endBlock
+      endBlock <- block `named` "print.end"
+      return ()
     go l (TId name) = do
       datas <- gets datas
       let DataDecl {..} = lookup' name datas
