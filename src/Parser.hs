@@ -63,11 +63,27 @@ class Parsable a where
   parsedApp :: a -> a -> Parser a
 
 keywords :: [String]
-keywords = ["use", "mod", "data", "val", "let", "match", "in", "unit", "true", "false", "if", "then", "else", "panic", "_"]
+keywords =
+  [ "use",
+    "mod",
+    "data",
+    "val",
+    "let",
+    "match",
+    "in",
+    "rec",
+    "unit",
+    "true",
+    "false",
+    "if",
+    "then",
+    "else",
+    "panic",
+    "_" ]
 
 moduleParser :: Name -> ModuleTree -> Parser ModuleTree
 moduleParser path current =
-  try (symbol (use <|> module' <|> data' <|> value)) <|> return current
+  (try sc' >> (use <|> module' <|> data' <|> value <|> (eof >> return current))) <|> return current
   where
     use = do
       paths <- useDeclParser
@@ -163,6 +179,7 @@ instance Parsable (Typed Expr) where
     <|> typed matchbinding
     <|> typed ifThenElse
     <|> typed panic
+    <|> typed recbranch
     <|> try (typed (Id <$> name))
     <|> try (symbol $ key "unit" >> return (Val Unit ::: TUnit))
     <|> try (symbol $ key "true" >> return (Val (Bool True) ::: TBool))
@@ -283,29 +300,18 @@ function :: Parser Expr
 function = do
   try $ symbol $ (char '\\' <|> char '\x3bb')
   cases <- strictBlockOf $ some $ matchCase
-  case cases of
-    [(pats, expr)] ->
-      case names pats of
-        Just xs -> return $ Val $ Func xs expr
-        Nothing -> caseFunction cases
-    (_:_) -> caseFunction cases
-  where
-    names [] = Just []
-    names (PAny (Just name) ::: ty : ps) = (name ::: ty :) <$> names ps
-    names _ = Nothing
-    caseFunction cases = do
-      sequence_ $ for tailed $ \(pats, _) ->
-        if length pats /= len then
-          fail "different number of patterns in function cases"
-        else
-          return ()
-      return $ Val $ Func (mapTy idents) $ Match (mapTy $ map Id idents) cases ::: t0
-      where
-        ((p0, _ ::: t0) : tailed) = cases
-        len = length p0
-        types = map typeof p0
-        mapTy xs = zipWith (:::) xs types
-        idents = for [0..len-1] $ \n -> Name ["{-" ++ show n ++ "-}"]
+  let
+    ((p0, _ ::: t0) : tailed) = cases
+    len = length p0
+    types = map typeof p0
+    mapTy xs = zipWith (:::) xs types
+    idents = for [0..len-1] $ \n -> Name ["{-" ++ show n ++ "-}"]
+  sequence_ $ for tailed $ \(pats, _) ->
+    if length pats /= len then
+      fail "different number of patterns in function cases"
+    else
+      return ()
+  return $ Val $ Func (mapTy idents) $ Match (mapTy $ map Id idents) cases ::: t0
 
 letbinding :: Parser Expr
 letbinding = do
@@ -365,6 +371,11 @@ panic = do
   return $ Panic $ dropWhile (' ' ==) msg
   where
     notNewline ch = ch /= '\n' && ch /= '\r'
+
+recbranch :: Parser Expr
+recbranch = do
+  try $ symbol $ key "rec"
+  Rec <$> many (try parserNoSpace)
 
 number :: Parser Word64
 number = symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal) <?> "number"

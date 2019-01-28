@@ -19,6 +19,7 @@ data Expr
   | Let (Typed Name) (Typed Expr) (Typed Expr)  -- (let a = b in c)
   | Match [Typed Expr] [MatchCase]              -- (match a in b c)
   | Panic String                                -- panic
+  | Rec [Typed Expr]                            -- (rec ...)
   | ICons Name String [Typed Expr]
   deriving Eq
 
@@ -87,6 +88,8 @@ instance Show Expr where
   show (Match exprs cases) = "(match " ++ intercalate " " (map show exprs) ++ " in\n" ++ intercalate "\n" (map showCase cases) ++ ")"
   show (Panic []) = "(panic\n)"
   show (Panic msg) = "(panic " ++ msg ++ "\n)"
+  show (Rec []) = "rec"
+  show (Rec args) = "(rec " ++ intercalate " " (map show args) ++ ")"
   show (ICons _ variant []) = variant
   show (ICons _ variant list) =
     "(" ++ intercalate " " (variant : map show list) ++ ")"
@@ -95,7 +98,7 @@ showCase :: MatchCase -> String
 showCase (p, e) = "  " ++ intercalate " " (map show p) ++ " -> " ++ show e
 
 instance Show Type where
-  show (TAnon n) = "{-" ++ show n ++ "-}"
+  show (TAnon n) = "_"
   show (TId s) = show s
   show (TVar s) = s
   show TArrow = "(->)"
@@ -276,6 +279,19 @@ constructorPatternsForData (name, DataDecl {..}) = map patFor variants
     patFor (vname, types) = (name.|.vname, (ty, types))
     ty = foldl' TApp (TId name) $ map TVar typeParams
 
+casesContainRec :: [MatchCase] -> Bool
+casesContainRec [] = False
+casesContainRec ((_, e):rest) =
+  exprContainsRec e || casesContainRec rest
+
+exprContainsRec :: Typed Expr -> Bool
+exprContainsRec (expr ::: _) =
+  case expr of
+    If _ t e -> exprContainsRec t || exprContainsRec e
+    Let _ _ expr -> exprContainsRec expr
+    Rec _ -> True
+    _ -> False
+
 deps :: Bool -> [Name] -> Typed Expr -> State (Set.Set Name) ()
 deps lam env (expr ::: _) =
   case expr of
@@ -299,6 +315,7 @@ deps lam env (expr ::: _) =
       let caseDeps (p, e) = deps lam ((map fst $ allPatternNames p) ++ env) e
       sequence_ $ map caseDeps cases
     Panic _ -> return ()
+    Rec args -> sequence_ $ map (deps lam env) args
     ICons _ _ list -> sequence_ $ for list $ deps lam env
 
 -- TODO verification of non-duplication for pattern names
@@ -348,6 +365,8 @@ countLocals (expr ::: _) env =
     Match exprs cases ->
       matchLocals exprs cases $ foldr ($) env $ map countLocals exprs
     Panic _ -> env
+    Rec args ->
+      foldr ($) env $ map countLocals args
     ICons _ _ list ->
       foldr ($) env $ map countLocals list
   where
@@ -393,6 +412,8 @@ countOccurances name = go
           in
             foldr ($) x' $ map iterCase cases
         Panic _ -> x
+        Rec args ->
+          foldr ($) x $ map go args
         ICons _ _ list ->
           foldr ($) x $ map go list
 
@@ -421,6 +442,8 @@ substitute name value (expr ::: ty) =
         else
           (p, substitute name value e)
     Panic msg -> Panic msg
+    Rec args ->
+      Rec $ for args $ substitute name value
     ICons n variant list ->
       ICons n variant $ for list $ substitute name value
 
@@ -503,6 +526,9 @@ isCap ch
 
 for :: [a] -> (a -> b) -> [b]
 for = flip map
+
+for2 :: [a] -> [b] -> (a -> b -> c) -> [c]
+for2 xs ys f = zipWith f xs ys
 
 lookup' :: (Eq k, Show k, Show v) => k -> [(k, v)] -> v
 lookup' name xs = go xs

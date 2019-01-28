@@ -72,22 +72,22 @@ verifyTy datas = ver []
       Left (name ++ " expects no type parameters, but was provided with " ++ show len)
 
 verifyExpr :: Env DataDecl -> Typed Expr -> Either String ()
-verifyExpr datas = ver
+verifyExpr datas = ver True
   where
-    ver (expr ::: ty) = do
+    ver isTail (expr ::: ty) = do
       verifyTy datas ty
       case expr of
-        Val (Func _ expr) -> ver expr
-        Op _ a b -> ver a >> ver b
-        App a b -> ver a >> ver b
-        If i t e -> ver i >> ver t >> ver e
-        Let _ val expr -> ver val >> ver expr
+        Val (Func _ expr) -> ver True expr
+        Op _ a b -> ver False a >> ver False b
+        App a b -> ver False a >> ver False b
+        If i t e -> ver False i >> ver isTail t >> ver isTail e
+        Let _ val expr -> ver False val >> ver isTail expr
         Match xs cases -> do
-          sequence_ $ map ver xs
+          sequence_ $ map (ver False) xs
           let defs = defaultVPats $ length xs
           result <-
             iter cases [defs] $ \(pats, expr) vs -> do
-              ver expr
+              ver True expr
               let vs' = concat $ map (go pats) vs
               if vs' == vs then
                 Left ("unreachable pattern: " ++ intercalate " " (map show pats))
@@ -97,7 +97,10 @@ verifyExpr datas = ver
             Right ()
           else
             Left ("pattern match is missing cases:\n" ++ unlines (map (("  "++) . intercalate " " . map show) result))
-        ICons _ _ xs -> sequence_ $ map ver xs
+        Rec _
+          | isTail -> Right ()
+          | otherwise -> Left ("cannot use `rec` outside of tail position")
+        ICons _ _ xs -> sequence_ $ map (ver False) xs
         _ -> Right ()
     enumerate :: Type -> Env [VPattern]
     enumerate (TApp a _) = enumerate a

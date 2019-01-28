@@ -157,6 +157,8 @@ instance NameResolve Expr where
           expr <- contWith (names ++ l) expr
           return (pats, expr)
         return $ Match exprs cases
+      Rec args ->
+        Rec <$> sequence (map cont args)
       ICons name variant list ->
         ICons name variant <$> sequence (map cont list)
       other -> Right other

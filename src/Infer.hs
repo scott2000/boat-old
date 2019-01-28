@@ -93,7 +93,7 @@ infer m env ps count = do
     globals :: Globals
     globals = Globals m (Map.fromList (map typeNameList env)) ps
     checkTypes :: (Name, Typed Expr) -> InferState Type
-    checkTypes (name, expr) = ty globals [] expr
+    checkTypes (name, expr) = ty globals [] Nothing expr
     simplifyTypes :: (Name, Typed Expr) -> InferState (Name, Typed Expr)
     simplifyTypes (name, expr) = do
       m <- gets getAnonMap
@@ -235,8 +235,8 @@ inferAlias other = return other
 letters :: String
 letters = "abcdefghijklmnopqrstuvwxyz"
 
-generic_name :: Int -> String
-generic_name = helper 26 1
+genericName :: Int -> String
+genericName = helper 26 1
   where
     helper m s c =
       if c >= m then
@@ -252,7 +252,7 @@ uniqueName deny n
   | Set.member name deny = uniqueName deny (n+1)
   | otherwise = (n+1, name)
   where
-    name = generic_name n
+    name = genericName n
 
 quantify :: Set.Set String -> Type -> QuantifyState ()
 quantify deny (TAnon a) = do
@@ -314,6 +314,8 @@ instance TypeMap Expr where
       Match exprs cases ->
         Match (map (mapTypes f) exprs) $ for cases $ \(pats, expr) ->
           (map (mapTypes f) pats, mapTypes f expr)
+      Rec args ->
+        Rec $ for args $ mapTypes f
       ICons name variant list ->
         ICons name variant $ for list $ mapTypes f
       other -> other
@@ -330,6 +332,7 @@ instance TypeMap Expr where
         sequence_ $ for cases $ \(pats, expr) -> do
           verifyTypes expr
           sequence_ $ map verifyTypes pats
+      Rec args -> sequence_ $ map verifyTypes args
       ICons _ _ list -> sequence_ $ map verifyTypes list
       _ -> Right ()
 
@@ -341,6 +344,7 @@ instance TypeMap Expr where
       If i t e -> getLocals i >> getLocals t >> getLocals e
       Let name val expr -> getLocals name >> getLocals val >> getLocals expr
       Match exprs cases -> sequence_ (map getLocals exprs) >> sequence_ (map caseLocals cases)
+      Rec args -> sequence_ $ map getLocals args
       ICons _ _ list -> sequence_ $ map getLocals list
       _ -> return ()
     where
@@ -371,65 +375,82 @@ instance TypeMap Pattern where
   getLocals (PCons _ pats) = sequence_ $ map getLocals pats
   getLocals _ = return ()
 
-ty :: Globals -> Env Type -> Typed Expr -> InferState Type
-ty glob env (x ::: fin) = do
+ty :: Globals -> Env Type -> Maybe ([Type], Type) -> Typed Expr -> InferState Type
+ty glob env ctx (x ::: fin) = do
   case x of
     Val Unit -> unify fin TUnit
     Val (Nat _) -> unify fin TNat
     Val (Bool _) -> unify fin TBool
     Val (Cons _ _ _) -> return ()
     Val (Func xs expr) -> do
-      let types = map (\(n ::: t) -> (n, t)) xs
-      res <- ty glob (reverse types ++ env) expr
-      unify fin $ mkFuncTy (map typeof xs) res
+      let
+        envTypes = map (\(n ::: t) -> (n, t)) xs
+        types = map typeof xs
+      res <- ty glob (reverse envTypes ++ env) (Just (types, typeof expr)) expr
+      unify fin $ mkFuncTy types res
     Id name -> do
       ty <-
         case lookup name env of
           Just ty -> return ty
           Nothing ->
-            case Map.lookup name (globalVariables glob) of
+            case Map.lookup name $ globalVariables glob of
               Just ty -> alias globalAlias ty
               Nothing ->
-                case Map.lookup name (inferenceVariables glob) of
+                case Map.lookup name $ inferenceVariables glob of
                   Just ty -> alias inferAlias ty
                   Nothing -> lift $ Left ("cannot find value: `" ++ show name ++ "`")
       unify fin ty
     Op op a b -> do
-      a <- ty glob env a
+      a <- ty glob env ctx a
       (t, r, _) <- lift $ getOp op
-      b <- ty glob env b
+      b <- ty glob env ctx b
       unify a t
       unify b t
       unify fin r
     App a b -> do
-      a <- ty glob env a
-      b <- ty glob env b
+      a <- ty glob env ctx a
+      b <- ty glob env ctx b
       unify a $ TFunc b fin
     If i t e -> do
-      i <- ty glob env i
+      i <- ty glob env ctx i
       unify i TBool
-      t <- ty glob env t
-      e <- ty glob env e
+      t <- ty glob env ctx t
+      e <- ty glob env ctx e
       unify t e
       unify fin t
     Let (name ::: ex) val expr -> do
-      v <- ty glob env val
+      v <- ty glob env ctx val
       unify v ex
-      e <- ty glob ((name, v):env) expr
+      e <- ty glob ((name, v):env) ctx expr
       unify fin e
     Match exprs cases -> do
-      ts <- sequence $ map (ty glob env) exprs
+      ts <- sequence $ map (ty glob env ctx) exprs
       cs <- sequence $ map casety cases
       sequence_ $ for cs $ \(ps, e) -> do
         sequence_ $ zipWith unify ts ps
         unify fin e
+      where
+        casety (pats, expr) = do
+          let env' = allPatternNames pats ++ env
+          (,) <$> sequence (map (patty glob) pats) <*> ty glob env' (Just (map typeof pats, typeof expr)) expr
     Panic msg -> return ()
+    Rec args ->
+      case ctx of
+        Just (types, t) ->
+          let
+            curLen = length args
+            targetLen = length types
+          in
+            if curLen == targetLen then do
+              sequence_ $ for2 args types $ \arg fin -> do
+                t <- ty glob env ctx arg
+                unify fin t
+              unify fin t
+            else
+              lift $ Left ("`rec` expects " ++ show targetLen ++ " arguments, but found " ++ show curLen)
+        Nothing -> lift $ Left "cannot use `rec` outside of function or match"
     ICons _ _ _ -> return ()
   return fin
-  where
-    casety (pats, expr) = do
-      let env' = allPatternNames pats ++ env
-      (,) <$> sequence (map (patty glob) pats) <*> ty glob env' expr
 
 patty :: Globals -> Typed Pattern -> InferState Type
 patty glob (x ::: fin) = do

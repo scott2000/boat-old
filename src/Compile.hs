@@ -1,4 +1,4 @@
-{-# LANGUAGE RecursiveDo, OverloadedStrings, RecordWildCards #-}
+{-# LANGUAGE RecursiveDo, OverloadedStrings, RecordWildCards, FlexibleContexts #-}
 
 module Compile (compile) where
 
@@ -21,6 +21,7 @@ import LLVM.IRBuilder.Constant
 import LLVM.IRBuilder.Module
 import LLVM.IRBuilder.Instruction as INST
 import LLVM.IRBuilder.Monad
+import LLVM.IRBuilder.Internal.SnocList
 
 import LLVM.Internal.Target (withHostTargetMachine, getTargetMachineDataLayout)
 import LLVM.Internal.Context (withContext)
@@ -35,16 +36,16 @@ import Data.Word
 import Data.List
 import Data.String
 import Control.Monad.State hiding (void)
+import Control.Monad.Trans.Maybe
 import Data.Text.Lazy (unpack)
 import qualified Data.Map as Map
 
-{-
+{- TODO remove excessive `lift`s
 
 Current Goals:
 
 - reimplement repl
 - data modules (constructors in separate module, module extension)
-- add `rec` keyword for tail recursion
 - better error handling
 - char, int, float types
 - slices/arrays/strings?
@@ -97,6 +98,8 @@ data Codegen = Codegen
     getPrintf :: Maybe Operand,
     getDebugTrap :: Maybe Operand,
     getExit :: Maybe Operand,
+    -- generator state
+    getRecBrInfo :: Maybe (LLVM.Name, [(LLVM.Name, [Operand])]),
     getFunctionName :: String }
 
 data ClosureData = ClosureData
@@ -110,6 +113,7 @@ data ClosureData = ClosureData
 
 type BuilderState = StateT Codegen ModuleBuilder
 type Builder = IRBuilderT BuilderState
+type FallibleBuilder = MaybeT Builder
 
 newCodegen :: RunMap -> Env DataDecl -> Word32 -> Codegen
 newCodegen runMap datas wordSize = Codegen
@@ -133,17 +137,18 @@ newCodegen runMap datas wordSize = Codegen
     getPrintf = Nothing,
     getDebugTrap = Nothing,
     getExit = Nothing,
+    getRecBrInfo = Nothing,
     getFunctionName = "main" }
 
 allValues :: BuilderState [Name]
 allValues = Map.keys <$> gets getRunMap
 
-inVal :: Builder a -> String -> Builder a
+inVal :: (MonadIRBuilder m, MonadState Codegen m) => m a -> String -> m a
 inVal builder name' = inLet builder (const name')
 
-inLet :: Builder a -> (String -> String) -> Builder a
+inLet :: (MonadIRBuilder m, MonadState Codegen m) => m a -> (String -> String) -> m a
 inLet builder namef = do
-  s <- lift get
+  s <- get
   let name = getFunctionName s
   put (s { getFunctionName = namef name })
   r <- builder
@@ -233,28 +238,32 @@ genVal isConstant app env (v ::: ty) =
     Func xs expr -> do
       closureData <- lift (getStaticClosureData xs expr)
       if length (getParameters closureData) == length app then
-        genStaticCall app closureData
+        genStaticCall app env closureData
       else do
         genClosureForData env closureData >>= genApp ty app
 
 unit :: Operand
 unit = LLVM.ConstantOperand (C.Struct Nothing False [])
 
-genExpr :: [Operand] -> Env (Typed Operand) -> Typed Expr -> Builder Operand
+genExpr :: [Operand] -> Env (Typed Operand) -> Typed Expr -> FallibleBuilder Operand
 genExpr app env (expr ::: ty) =
   case expr of
     Val v ->
-      genVal False app env (v ::: ty)
+      lift $ genVal False app env (v ::: ty)
     App a b -> do
       arg <- genExpr [] env b `named` "app.arg"
       genExpr (arg:app) env a
     Id name ->
-      case lookup name env of
+      lift $ case lookup name env of
         Just (x ::: _) -> genApp ty app x
         Nothing -> do
           s <- lift get
           case evaluate (name ::: ty) $ getRunMap s of
-            Left err -> fail err
+            Left err -> do
+              n <- gets getFunctionName
+              error ("error evaluating " ++ show name ++ ": " ++ err ++ " (in " ++ n ++ ")\n"
+                ++ "  current environment: " ++ show (map (show . fst) env))
+              -- TODO proper error handling
             Right (val, runMap) -> do
               put $ s { getRunMap = runMap }
               genVal False app [] val `inVal` show name
@@ -263,10 +272,10 @@ genExpr app env (expr ::: ty) =
       let bTy = typeof b
       a <- genExpr [] env a `named` "lhs"
       b <- genExpr [] env b `named` "rhs"
-      rcDec 1 a aTy
-      rcDec 1 b bTy
-      r <- genOp op a b
-      genApp ty app r
+      lift $ rcDec 1 a aTy
+      lift $ rcDec 1 b bTy
+      r <- lift $ genOp op a b
+      lift $ genApp ty app r
     If (Val (Bool b) ::: _) t e ->
       if b then
         genExpr app env t
@@ -285,31 +294,64 @@ genExpr app env (expr ::: ty) =
       else do
         val <- genExpr [] env val `named` (fromString $ show name) `inLet` (++ "." ++ show name)
         if inc /= 0 then
-          rcInc inc val ty
+          lift $ rcInc inc val ty
         else
           return ()
         genExpr app ((name, val ::: ty):env) expr
     Match exprs cases -> mdo
-      let gen n expr = (::: typeof expr) <$> genExpr [] env expr `named` fromString ("match.expr." ++ show n)
-      let modify = matchLocals exprs cases localEnv
-      vals <- sequence $ zipWith gen [0..] exprs
-      let genCases = map toGenCase cases
-      phiCases <- genMatch app env modify vals genCases ok err []
-
-      err <- block `named` "match.err"
-      unreachable
+      initialVals <- sequence $ for2 [0..] exprs $ \n expr ->
+        (::: typeof expr) <$> genExpr [] env expr `named` fromString ("match.expr." ++ show n)
+      let isRec = casesContainRec cases
+      initialS <- get
+      vals <-
+        if isRec then mdo
+          entryBlock <- currentBlock
+          br matchBlock
+          matchBlock <- block `named` "match.recurse"
+          put $ initialS { getRecBrInfo = Just (matchBlock, []) }
+          sequence $ for2 [0..] initialVals $ \n (v ::: ty) ->
+            (::: ty) <$> (phi [(v, entryBlock)] `named` fromString ("match.rec." ++ show n))
+        else
+          return initialVals
+      let
+        modify = matchLocals exprs cases localEnv
+        genCases = map toGenCase cases
+      phiCases <- lift $ genMatch app env modify vals genCases ok []
 
       ok <- block `named` "match.ok"
-      phi phiCases
+      if isRec then do
+        finalS <- get
+        put $ finalS { getRecBrInfo = getRecBrInfo initialS }
+        case getRecBrInfo finalS of
+          Just (targetBlock, startCases) ->
+            lift $ updateBlockBranches targetBlock startCases
+          Nothing -> error "forgotten rec info"
+      else
+        return ()
+      if null phiCases then do
+        unreachable
+        mzero
+      else
+        phi phiCases
     Panic msg -> do
       if null msg then
-        puts emptyPanic
+        lift $ puts emptyPanic
       else
-        puts msg
-      exit 1
-      gen <- lift $ genTy ty
-      return $ LLVM.ConstantOperand $ C.Undef gen
-      --TODO replace this with `unreachable` and add support later
+        lift $ puts msg
+      lift $ exit 1
+      unreachable
+      mzero
+    Rec args -> do
+      let gen n expr = genExpr [] env expr `named` fromString ("rec.arg." ++ show n)
+      vals <- sequence $ zipWith gen [0..] args
+      blockName <- currentBlock
+      s <- get
+      case getRecBrInfo s of
+        Just (targetBlock, branches) -> do
+          br targetBlock
+          put $ s { getRecBrInfo = Just (targetBlock, (blockName, vals) : branches) }
+          mzero
+        Nothing -> error "rec outside match"
     ICons name variant list -> do
       let
         genCons n expr = do
@@ -317,7 +359,7 @@ genExpr app env (expr ::: ty) =
       args <- sequence $ zipWith genCons [0..] list
       datas <- gets datas
       let DataDecl {..} = lookup' name datas
-      case variants of
+      lift $ case variants of
         [_] ->
           genStruct args
         (_:_)
@@ -339,6 +381,33 @@ genExpr app env (expr ::: ty) =
   where
     localEnv = toLocalEnv env
     fromEnv (name, count) = (lookup' name env, count)
+
+updateBlockBranches :: LLVM.Name -> [(LLVM.Name, [Operand])] -> Builder ()
+updateBlockBranches targetBlock [] = error ("no cases in rec for block: " ++ show targetBlock)
+updateBlockBranches targetBlock cases =
+  liftIRState $ modify $ \s -> s { builderBlocks = SnocList $ updateAll $ unSnocList $ builderBlocks s }
+  where
+    len = length $ snd $ head cases
+    updateAll [] = error ("cannot find target block: " ++ show targetBlock)
+    updateAll (LLVM.BasicBlock name inst term : rest)
+      | name == targetBlock =
+        let
+          iter _ [] = []
+          iter n (named : rest)
+            | n < len =
+              case named of
+                name LLVM.:= instruction ->
+                  name LLVM.:= change instruction : iter (n+1) rest
+                _ -> error "expected named phi"
+            | otherwise = named : rest
+            where
+              change (LLVM.Phi t i m) = LLVM.Phi t (addAll i cases) m
+              change _ = error "not enough phi instructions for recursion"
+              addAll acc [] = acc
+              addAll acc ((name, ops):rest) = addAll ((ops !! n, name):acc) rest
+        in
+          LLVM.BasicBlock name (iter 0 inst) term : rest
+      | otherwise = LLVM.BasicBlock name inst term : updateAll rest
 
 data GenCase = GenCase
   { casePats :: [Typed Pattern],
@@ -394,15 +463,22 @@ genMatch :: [Operand]
          -> [Typed Operand]
          -> [GenCase]
          -> LLVM.Name
-         -> LLVM.Name
          -> [(Operand, LLVM.Name)]
          -> Builder [(Operand, LLVM.Name)]
-genMatch app env modify = gen
+genMatch app env modify = gen Nothing
   where
-    gen _ [] _ err bs = do
-      br err
+    gen :: Maybe LLVM.Name
+        -> [Typed Operand]
+        -> [GenCase]
+        -> LLVM.Name
+        -> [(Operand, LLVM.Name)]
+        -> Builder [(Operand, LLVM.Name)]
+    gen err _ [] _ bs = do
+      case err of
+        Just b -> br b
+        Nothing -> unreachable
       return bs
-    gen [] (GenCase { casePats = [], .. } : cases) ok err bs = do
+    gen err [] (GenCase { casePats = [], .. } : cases) ok bs = do
       let
         exprLocals = countLocals caseExpr $ toLocalEnv env
         decs = zipEnv (-) modify exprLocals
@@ -436,11 +512,15 @@ genMatch app env modify = gen
               rcDec (-modCount) o ty
         else
           return ()
-      res <- genExpr app (caseEnv ++ env) caseExpr `named` "match.res"
-      name <- currentBlock
-      br ok
-      return ((res, name):bs)
-    gen (allV@((tv@(v ::: vty)):vs)) (allCases@(GenCase { casePats = (p ::: _):_ } : _)) ok err bs = case p of
+      m <- runMaybeT (genExpr app (caseEnv ++ env) caseExpr) `named` "match.res"
+      case m of
+        Just res -> do
+          name <- currentBlock
+          br ok
+          return ((res, name):bs)
+        Nothing ->
+          return bs
+    gen err (allV@((tv@(v ::: vty)):vs)) (allCases@(GenCase { casePats = (p ::: _):_ } : _)) ok bs = case p of
         PAny binding -> do
           let
             collectAny (GenCase { casePats = (PAny binding ::: _) : ps, .. } : cases) =
@@ -464,11 +544,11 @@ genMatch app env modify = gen
             collectAny other = ([], other)
             (cases, rest) = collectAny allCases
           if null rest then
-            gen vs cases ok err bs
+            gen err vs cases ok bs
           else mdo
-            blocks <- gen vs cases ok cont bs
+            blocks <- gen (Just cont) vs cases ok bs
             cont <- block `named` "match.cont"
-            gen allV rest ok err blocks
+            gen err allV rest ok blocks
         PNat _ -> mdo
           let
             collectNat (GenCase { casePats = (PNat n ::: _) : ps, .. } : cases) =
@@ -480,17 +560,22 @@ genMatch app env modify = gen
 
           (def, blocks) <-
             if null rest then
-              return (err, bs)
+              case err of
+                Just b -> return (b, bs)
+                Nothing -> do
+                  def <- block `named` "match.impossible.def"
+                  unreachable
+                  return (def, bs)
             else do
               def <- block `named` "match.def"
-              blocks <- gen allV rest ok err bs
+              blocks <- gen err allV rest ok bs
               return (def, blocks)
 
           let
             natBranches [] bs = return ([], bs)
             natBranches ((n, cs):rest) bs = do
               name <- block `named` fromString ("match.nat." ++ show n)
-              blocks <- gen vs cs ok def bs
+              blocks <- gen (Just def) vs cs ok bs
               (branches, blocks') <- natBranches rest blocks
               return ((C.Int 64 $ toInteger n, name):branches, blocks')
           (branches, blocks') <- natBranches (Map.toList cases) blocks
@@ -511,18 +596,18 @@ genMatch app env modify = gen
           condBr v thenBlock elseBlock
 
           thenBlock <- block `named` "match.then"
-          blocks <- gen vs t ok cont bs
+          blocks <- gen cont vs t ok bs
 
           elseBlock <- block `named` "match.else"
-          blocks' <- gen vs f ok cont blocks
+          blocks' <- gen cont vs f ok blocks
 
           (cont, blocks'') <-
             if null rest then
               return (err, blocks')
             else mdo
               cont <- block `named` "match.cont"
-              blocks'' <- gen allV rest ok err blocks'
-              return (cont, blocks'')
+              blocks'' <- gen err allV rest ok blocks'
+              return (Just cont, blocks'')
           return blocks''
         PCons _ _ -> do
           variants <- lift $ getDataVariants $ vty
@@ -536,11 +621,11 @@ genMatch app env modify = gen
                 (cases, rest) = collectCons allCases
               values <- buildTyped types $ buildExtract v
               if null rest then
-                gen (values ++ vs) cases ok err bs
+                gen err (values ++ vs) cases ok bs
               else mdo
-                blocks <- gen (values ++ vs) cases ok cont bs
+                blocks <- gen (Just cont) (values ++ vs) cases ok bs
                 cont <- block `named` "match.cont"
-                gen allV rest ok err blocks
+                gen err allV rest ok blocks
             (_:_) -> mdo
               let
                 collectCons (GenCase { casePats = (PCons n l ::: _) : ps, .. } : cases) =
@@ -565,10 +650,15 @@ genMatch app env modify = gen
 
               (def, blocks) <-
                 if null rest then
-                  return (err, bs)
+                  case err of
+                    Just b -> return (b, bs)
+                    Nothing -> do
+                      def <- block `named` "match.impossible.def"
+                      unreachable
+                      return (def, bs)
                 else do
                   def <- block `named` "match.def"
-                  blocks <- gen allV rest ok err bs
+                  blocks <- gen err allV rest ok bs
                   return (def, blocks)
 
               let
@@ -576,7 +666,7 @@ genMatch app env modify = gen
                 consBranches ((n, (cs, anyMap)):rest) bs = do
                   name <- block `named` fromString ("match.cons." ++ show n)
                   let types = snd $ variants !! n
-                  wordSize <- lift $ gets getWordSize
+                  wordSize <- gets getWordSize
                   let isize = LLVM.IntegerType wordSize
                   newValues <-
                     if null types then
@@ -599,7 +689,7 @@ genMatch app env modify = gen
                         caseMod = addModDirect (-1) tv decPtr dataPtr $ addMods updatedValues caseMod,
                         .. }
                     updatedCases = map updateCase cs
-                  blocks <- gen (updatedValues ++ vs) updatedCases ok def bs
+                  blocks <- gen (Just def) (updatedValues ++ vs) updatedCases ok bs
                   (branches, blocks') <- consBranches rest blocks
                   return ((C.Int 32 $ toInteger n, name):branches, blocks')
               (branches, blocks') <- consBranches (Map.toList cases) blocks
@@ -615,9 +705,16 @@ getVariantId name = go 0
 toLocalEnv :: Env (Typed Operand) -> Env Int
 toLocalEnv = map (\(x, _) -> (x, 0))
 
-genStaticCall :: [Operand] -> ClosureData -> Builder Operand
-genStaticCall args closureData =
-  llvmFastCall (getFunc closureData) (map (\x -> (x, [])) args)
+genStaticCall :: [Operand] -> Env (Typed Operand) -> ClosureData -> Builder Operand
+genStaticCall args env closureData =
+  let
+    freeNames = getFreeVars closureData
+    frees = for freeNames $ \(name ::: _) ->
+      case lookup name env of
+        Nothing -> error ("missing free variable: " ++ show name)
+        Just (x ::: _) -> (x, [])
+  in
+    llvmFastCall (getFunc closureData) (frees ++ map (\x -> (x, [])) args)
 
 genApp :: Type -> [Operand] -> Operand -> Builder Operand
 genApp _  [] val = return val
@@ -629,27 +726,41 @@ genApp (TFunc _ ty) [arg] closure = do
 genApp (TFunc _ ty) (arg:rest) closure =
   genCallClosure closure arg `named` "partial" >>= genApp ty rest
 
-genIf :: Operand -> Builder Operand -> Builder Operand -> [(Typed Operand, Int)] -> Builder Operand
+genIf :: Operand -> FallibleBuilder Operand -> FallibleBuilder Operand -> [(Typed Operand, Int)] -> FallibleBuilder Operand
 genIf i t e diffs = mdo
   condBr i thenBlock elseBlock
   thenBlock <- block `named` "if.then"
   sequence_ $ map thenDec diffs
-  thenRes <- t `named` "if.then.res"
-  thenEndBlock <- currentBlock
-  br endBlock
+  thenList <-lift $ do
+    m <- runMaybeT t `named` "if.then.res"
+    case m of
+      Just res -> do
+        resBlock <- currentBlock
+        br endBlock
+        return [(res, resBlock)]
+      Nothing -> return []
   elseBlock <- block `named` "if.else"
   sequence_ $ map elseDec diffs
-  elseRes <- e `named` "if.else.res"
-  elseEndBlock <- currentBlock
-  br endBlock
+  elseList <- lift $ do
+    m <- runMaybeT e `named` "if.else.res"
+    case m of
+      Just res -> do
+        resBlock <- currentBlock
+        br endBlock
+        return ((res, resBlock):thenList)
+      Nothing -> return thenList
   endBlock <- block `named` "if.end"
-  phi [(thenRes, thenEndBlock), (elseRes, elseEndBlock)]
+  if null elseList then do
+    unreachable
+    mzero
+  else
+    phi elseList
   where
     thenDec (o ::: ty, n)
-      | n < 0     = rcDec (-n) o ty
+      | n < 0     = lift $ rcDec (-n) o ty
       | otherwise = return ()
     elseDec (o ::: ty, n)
-      | n > 0     = rcDec n o ty
+      | n > 0     = lift $ rcDec n o ty
       | otherwise = return ()
 
 genTy :: Type -> BuilderState LLVM.Type
@@ -783,13 +894,13 @@ printx o = go []
           printf name []
         [(name, types)] -> do
           printf ("(" ++ name) []
-          sequence_ $ for (zip [0..] types) $ \(n, ty) -> do
+          sequence_ $ for2 [0..] types $ \n ty -> do
             val <- buildExtract o n
             printf " " []
             printx val (tr ty)
           printf ")" []
         (_:_) -> do
-          printer <- lift $ getPrinter variants
+          printer <- lift $ getPrinter $ for variants $ \(name, types) -> (name, map tr types)
           llvmFastCall (LLVM.ConstantOperand printer) [(o, [])]
           return ()
           where
@@ -808,7 +919,7 @@ printx o = go []
                       dataPtr <- extractValue v [1] `named` "match.ptr"
                       switch magic def branches
 
-                      branches <- sequence $ for (zip [0..] variants) $ \(n, (name, types)) -> do
+                      branches <- sequence $ for2 [0..] variants $ \n (name, types) -> do
                         caseBlock <- block `named` fromString name
                         if null types then
                           printf name []
@@ -816,7 +927,7 @@ printx o = go []
                           lltypes <- lift $ sequence $ map (genTy . tr) types
                           castPtr <- bitcast dataPtr (ptr (LLVM.StructureType False (isize : lltypes)))
                           printf ("(" ++ name) []
-                          sequence_ $ for (zip [0..] types) $ \(n, ty) -> do
+                          sequence_ $ for2 [0..] types $ \n ty -> do
                             val <- buildGep castPtr n
                             printf " " []
                             printx val (tr ty)
@@ -1140,6 +1251,14 @@ getFreeNames env expr = do
         App a b -> deps env a >> deps env b
         If i t e -> deps env i >> deps env t >> deps env e
         Let name val expr -> deps env val >> deps (valof name : env) expr
+        Match exprs cases -> do
+          sequence_ $ for exprs $ deps env
+          sequence_ $ for cases $ \(pats, expr) ->
+            deps (map fst (allPatternNames pats) ++ env) expr
+        Rec args ->
+          sequence_ $ for args $ deps env
+        ICons name variant list ->
+          sequence_ $ for list $ deps env
         _ -> return ()
 
 getStaticClosureData :: [Typed Name] -> Typed Expr -> BuilderState ClosureData
@@ -1170,8 +1289,10 @@ buildStaticClosure free params expr = mdo
       block `named` "entry"
       let localScope = countLocals expr localEnv
       sequence_ $ map localInc localScope
-      expr <- genExpr [] env expr `named` "ret"
-      ret expr
+      m <- runMaybeT (genExpr [] env expr `named` "ret")
+      case m of
+        Just res -> ret res
+        Nothing -> return ()
       where
         env = zipWith (\p a -> (valof p, a ::: typeof p)) combinedArgs args
         localEnv = toLocalEnv env
@@ -1185,7 +1306,7 @@ buildStaticClosure free params expr = mdo
     anons = anonymousFunctions codegen
     currentValue = getFunctionName codegen
     len = length anons
-    paramType (Name name ::: ty) = do
+    paramType (name ::: ty) = do
       gen <- genTy ty
       return (gen, fromString $ show name)
     nameBase = currentValue ++ "." ++ show len ++ "."

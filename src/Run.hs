@@ -96,6 +96,20 @@ run (expr ::: ty) =
       val <- sequence $ map run list
       return $ Cons name variant val ::: ty
 
+runOrRec :: Typed Expr -> RunState (Either [Typed Value] (Typed Value))
+runOrRec typedExpr@(expr ::: ty) =
+  case expr of
+    If i t e -> do
+      (cond ::: _) <- run i
+      case cond of
+        Bool True -> runOrRec t
+        Bool False -> runOrRec e
+    Let (name ::: _) val expr -> do
+      (v ::: _) <- run val
+      runOrRec $ substitute name (Val v) expr
+    Rec args -> Left <$> (sequence $ map run args)
+    _ -> Right <$> run typedExpr
+
 emptyPanic :: String
 emptyPanic = "attempted to evaluate `panic`"
 
@@ -112,11 +126,17 @@ funApp (f ::: fty) (x ::: _) =
           lift $ Left ("application to non-function type: " ++ show fty)
 
 runCases :: [MatchCase] -> [Typed Value] -> RunState (Typed Value)
-runCases [] ((v ::: ty):_) = lift $ Left ("invalid value for type " ++ show ty ++ ": " ++ show v)
-runCases ((ps, expr):cs) vs =
-  case tryAllPatterns ps vs expr of
-    Just expr -> run expr
-    Nothing -> runCases cs vs
+runCases allCases = go allCases
+  where
+    go [] ((v ::: ty):_) = lift $ Left ("invalid value for type " ++ show ty ++ ": " ++ show v)
+    go ((ps, expr):cs) vs =
+      case tryAllPatterns ps vs expr of
+        Just expr -> do
+          res <- runOrRec expr
+          case res of
+            Left args -> go allCases args
+            Right expr -> return expr
+        Nothing -> go cs vs
 
 tryAllPatterns :: [Typed Pattern] -> [Typed Value] -> Typed Expr -> Maybe (Typed Expr)
 tryAllPatterns [] [] expr = Just expr
