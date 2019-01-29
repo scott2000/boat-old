@@ -184,7 +184,7 @@ instance Parsable (Typed Expr) where
     <|> try (symbol $ key "unit" >> return (Val Unit ::: TUnit))
     <|> try (symbol $ key "true" >> return (Val (Bool True) ::: TBool))
     <|> try (symbol $ key "false" >> return (Val (Bool False) ::: TBool))
-    <|> (::: TNat) <$> Val <$> Nat <$> try number
+    <|> (::: TNat) <$> Val <$> Nat <$> number
     -- TODO fix bug: (3 : Nat) => cannot ascribe type Nat to expression of type Internal.Nat
 
   parsedOp "->" _ _ = fail ("cannot use (->) operator in expression")
@@ -378,7 +378,7 @@ recbranch = do
   Rec <$> many (try parserNoSpace)
 
 number :: Parser Word64
-number = symbol (try (char '0' >> char 'x' >> L.hexadecimal) <|> L.decimal) <?> "number"
+number = symbol ((try (char '0' >> char 'x') >> L.hexadecimal) <|> L.decimal) <?> "number"
 
 paren :: Parsable a => Parser a
 paren = do

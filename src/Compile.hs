@@ -98,6 +98,7 @@ data Codegen = Codegen
     getPrintf :: Maybe Operand,
     getDebugTrap :: Maybe Operand,
     getExit :: Maybe Operand,
+    getSideEffect :: Maybe Operand,
     -- generator state
     getRecBrInfo :: Maybe (LLVM.Name, [(LLVM.Name, [Operand])]),
     getFunctionName :: String }
@@ -137,6 +138,7 @@ newCodegen runMap datas wordSize = Codegen
     getPrintf = Nothing,
     getDebugTrap = Nothing,
     getExit = Nothing,
+    getSideEffect = Nothing,
     getRecBrInfo = Nothing,
     getFunctionName = "main" }
 
@@ -309,8 +311,10 @@ genExpr app env (expr ::: ty) =
           br matchBlock
           matchBlock <- block `named` "match.recurse"
           put $ initialS { getRecBrInfo = Just (matchBlock, []) }
-          sequence $ for2 [0..] initialVals $ \n (v ::: ty) ->
+          phis <- sequence $ for2 [0..] initialVals $ \n (v ::: ty) ->
             (::: ty) <$> (phi [(v, entryBlock)] `named` fromString ("match.rec." ++ show n))
+          lift couldLoopForever
+          return phis
         else
           return initialVals
       let
@@ -1287,6 +1291,7 @@ buildStaticClosure free params expr = mdo
     isFree name = name `elem` freeNames
     body args = do
       block `named` "entry"
+      couldLoopForever
       let localScope = countLocals expr localEnv
       sequence_ $ map localInc localScope
       m <- runMaybeT (genExpr [] env expr `named` "ret")
@@ -1745,6 +1750,25 @@ exit code = do
     Just exit ->
       return exit
   call exit [(lcint 32 code, [])]
+  return ()
+
+-- prevents llvm from treating infinite loops as undefined behavior
+couldLoopForever :: Builder ()
+couldLoopForever = do
+  s <- lift get
+  sideEffect <- case getSideEffect s of
+    Nothing -> do
+      sideEffect <-
+        lift $ llvmFn $ newFn
+          { fnName = "llvm.sideeffect",
+            fnRetTy = void,
+            fnParams = [],
+            fnAttrs = [FnAttr.InaccessibleMemOnly, FnAttr.NoUnwind] }
+      lift $ put $ s { getSideEffect = Just sideEffect }
+      return sideEffect
+    Just sideEffect ->
+      return sideEffect
+  call sideEffect []
   return ()
 
 llvmGlobal :: GlobalHelper -> BuilderState C.Constant

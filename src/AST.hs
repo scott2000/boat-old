@@ -88,8 +88,7 @@ instance Show Expr where
   show (Match exprs cases) = "(match " ++ intercalate " " (map show exprs) ++ " in\n" ++ intercalate "\n" (map showCase cases) ++ ")"
   show (Panic []) = "(panic\n)"
   show (Panic msg) = "(panic " ++ msg ++ "\n)"
-  show (Rec []) = "rec"
-  show (Rec args) = "(rec " ++ intercalate " " (map show args) ++ ")"
+  show (Rec args) = intercalate " " ("rec" : map show args)
   show (ICons _ variant []) = variant
   show (ICons _ variant list) =
     "(" ++ intercalate " " (variant : map show list) ++ ")"
