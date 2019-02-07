@@ -51,6 +51,20 @@ data Pattern
   | PCons Name [Typed Pattern]
   deriving Eq
 
+data Interface = Interface
+  { interfaceModules :: Map.Map String Interface,
+    interfaceOperators :: Map.Map String (Prec, Assoc),
+    interfaceTypes :: Set.Set String,
+    interfaceValues :: Set.Set String }
+
+data Assoc
+  = ALeft
+  | ANon
+  | ARight
+  deriving (Show, Eq)
+
+type Prec = Int
+
 data ModuleTree = ModuleTree
   { treeImports :: [UsePath],
     treeModules :: Map.Map String ModuleTree,
@@ -328,54 +342,70 @@ patternNames (pat ::: ty) =
 allPatternNames :: [Typed Pattern] -> Env Type
 allPatternNames = concat . map patternNames
 
-countLocals :: Typed Expr -> Env Int -> Env Int
-countLocals (expr ::: _) env =
-  case expr of
-    Val (Func xs expr) ->
-      let
-        remove (x, _) = (x, 0)
-        emptyEnv = map remove env
-        toEnv (x ::: _) = (x, 0)
-        env' = map toEnv xs ++ emptyEnv
-        fix (x, 0) = (x, 0)
-        fix (x, _) = (x, 1)
-      in
-        zipEnv (+) env $ map fix $ drop (length xs) $ countLocals expr env'
-    Val _ -> env
-    Id name ->
-      addName name env
-    Op _ a b ->
-      countLocals b $ countLocals a env
-    App a b ->
-      countLocals b $ countLocals a env
-    If i t e ->
-      let
-        env' = countLocals i env
-        te = countLocals t env'
-        ee = countLocals e env'
-      in
-        zipEnv max te ee
-    Let (name ::: _) val expr ->
-      let
-        valLocals = countLocals val env
-        env' = (name, 0) : valLocals
-      in
-        tail $ countLocals expr env'
-    Match exprs cases ->
-      matchLocals exprs cases $ foldr ($) env $ map countLocals exprs
-    Panic _ -> env
-    Rec args ->
-      foldr ($) env $ map countLocals args
-    ICons _ _ list ->
-      foldr ($) env $ map countLocals list
+countLocalsHelper :: Maybe (Env Int) -> Typed Expr -> Env Int -> Env Int
+countLocalsHelper recEnv = go
   where
+    go (expr ::: _) env =
+      case expr of
+        Val (Func xs expr) ->
+          let
+            remove (x, _) = (x, 0)
+            emptyEnv = map remove env
+            toEnv (x ::: _) = (x, 0)
+            env' = map toEnv xs ++ emptyEnv
+            fix (x, 0) = (x, 0)
+            fix (x, _) = (x, 1)
+          in
+            zipEnv (+) env $ map fix $ drop (length xs) $ go expr env'
+        Val _ -> env
+        Id name ->
+          addName name env
+        Op _ a b ->
+          go b $ go a env
+        App a b ->
+          go b $ go a env
+        If i t e ->
+          let
+            env' = go i env
+            te = go t env'
+            ee = go e env'
+          in
+            zipEnv minz te ee
+        Let (name ::: _) val expr ->
+          let
+            valLocals = go val env
+            env' = (name, 0) : valLocals
+          in
+            tail $ go expr env'
+        Match exprs cases ->
+          matchLocals cases $ foldr ($) env $ map go exprs
+        Panic _ -> env
+        Rec args ->
+          let env' = foldr ($) env $ map go args in
+          case recEnv of
+            Nothing -> env'
+            Just recs ->
+              let
+                lengthDiff = length env' - length recs
+                clear (name, _) = (name, 0)
+                recs' = map clear (take lengthDiff env') ++ recs
+              in
+                zipEnv (+) recs' env'
+        ICons _ _ list ->
+          foldr ($) env $ map go list
     addName name [] = []
     addName name (e@(n, x) : xs)
       | n == name = (n, x+1) : xs
       | otherwise = e : addName name xs
 
-matchLocals :: [Typed Expr] -> [MatchCase] -> Env Int -> Env Int
-matchLocals exprs cases env =
+countLocalsWithRec :: Env Int -> Typed Expr -> Env Int -> Env Int
+countLocalsWithRec = countLocalsHelper . Just
+
+countLocals :: Typed Expr -> Env Int -> Env Int
+countLocals = countLocalsHelper Nothing
+
+matchLocals :: [MatchCase] -> Env Int -> Env Int
+matchLocals cases env =
   let
     caseToEnv (pats, expr) = drop (length patternEnv) $ newEnv
       where
@@ -384,6 +414,18 @@ matchLocals exprs cases env =
         namesToEnv (name, _) = (name, 0)
   in
     combineEnvs $ map caseToEnv cases
+
+minz :: Int -> Int -> Int
+minz 0 y = y
+minz x 0 = x
+minz x y = min x y
+
+minzdiff :: Int -> Int -> Int
+minzdiff 0 y = -y
+minzdiff x 0 = x
+minzdiff x y
+  | x < y = 0
+  | otherwise = x - y
 
 countOccurances :: Name -> Typed Expr -> Int -> Int
 countOccurances name = go
@@ -399,17 +441,18 @@ countOccurances name = go
           | otherwise -> x
         Op _ a b -> go a $ go b x
         App a b -> go a $ go b x
-        If i t e -> go i $ go t $ go e x
+        If i t e ->
+          go i (minz (go t x) (go e x))
         Let (n ::: _) val expr ->
           go val $ if n == name then x else go expr x
         Match exprs cases ->
           let
             x' = foldr ($) x $ map go exprs
-            iterCase (pats, expr) x
-              | name `elem` map fst (allPatternNames pats) = x
-              | otherwise = go expr x
+            iterCase (pats, expr)
+              | name `elem` map fst (allPatternNames pats) = x'
+              | otherwise = go expr x'
           in
-            foldr ($) x' $ map iterCase cases
+            foldr1 minz $ map iterCase cases
         Panic _ -> x
         Rec args ->
           foldr ($) x $ map go args
@@ -453,7 +496,7 @@ checkFunc ((n ::: _):ns) name value expr
   | otherwise = checkFunc ns name value expr
 
 combineEnvs :: [Env Int] -> Env Int
-combineEnvs (e:es) = foldr (zipEnv max) e es
+combineEnvs (e:es) = foldr (zipEnv minz) e es
 
 zipEnv :: (a -> b -> c) -> Env a -> Env b -> Env c
 zipEnv _ [] [] = []

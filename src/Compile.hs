@@ -44,6 +44,7 @@ import qualified Data.Map as Map
 
 Current Goals:
 
+- replace let with match in implementation (being careful of `rec`)
 - reimplement repl
 - data modules (constructors in separate module, module extension)
 - better error handling
@@ -72,7 +73,7 @@ Possible Future Optimizations:
 -}
 
 debugMode :: Bool
-debugMode = False
+debugMode = True
 
 type DestructorEntry = ([Type], [Type]) -- args, frees
 type FunctionEntry = (LLVM.Type, Maybe LLVM.Type) -- arg, (Just = NF ret, Nothing = function)
@@ -286,9 +287,10 @@ genExpr app env (expr ::: ty) =
     If i t e -> do
       let thenScope = countLocals t localEnv
       let elseScope = countLocals e localEnv
-      let diffScope = zipEnv (-) thenScope elseScope
+      let diffScopeT = zipEnv minzdiff thenScope elseScope
+      let diffScopeE = zipEnv minzdiff elseScope thenScope
       i <- genExpr [] env i `named` "if.cond"
-      genIf i (genExpr app env t) (genExpr app env e) (map fromEnv diffScope)
+      genIf i (genExpr app env t) (genExpr app env e) (map fromEnv diffScopeT) (map fromEnv diffScopeE)
     Let (name ::: ty) val expr -> do
       let inc = countOccurances name expr (-1)
       if inc == (-1) then
@@ -318,7 +320,7 @@ genExpr app env (expr ::: ty) =
         else
           return initialVals
       let
-        modify = matchLocals exprs cases localEnv
+        modify = matchLocals cases localEnv
         genCases = map toGenCase cases
       phiCases <- lift $ genMatch app env modify vals genCases ok []
 
@@ -376,7 +378,7 @@ genExpr app env (expr ::: ty) =
             store rcPtr 0 $ lcint wordSize 1
             let
               storeAtOffset n arg = do
-                newPtr <- gep dataPtr [lcint 32 0, lcint 32 $ n+1] `named` fromString ("ptr." ++ show variant ++ "." ++ show n)
+                newPtr <- gep dataPtr [lcint 32 0, lcint 32 $ n+1] `named` fromString ("ptr." ++ variant ++ "." ++ show n)
                 store newPtr 0 arg
             sequence_ $ zipWith storeAtOffset [0..] args
             genStruct [lcint 32 number, dataPtrI8]
@@ -484,14 +486,15 @@ genMatch app env modify = gen Nothing
       return bs
     gen err [] (GenCase { casePats = [], .. } : cases) ok bs = do
       let
-        exprLocals = countLocals caseExpr $ toLocalEnv env
-        decs = zipEnv (-) modify exprLocals
-        dec [] m = m
-        dec ((name, 0):rest) m = dec rest m
-        dec ((name, n):rest) m =
-          let o = lookup' name env in
-          dec rest $ addModEntry (-n) o m
-        mods = dec decs caseMod
+        exprLocals = drop (length caseEnv) $ countLocalsWithRec modify caseExpr $ toLocalEnv (caseEnv ++ env)
+        updates = zipEnv (-) exprLocals modify
+        update [] m = m
+        update ((name, n):rest) m
+          | n == 0 = update rest m
+          | otherwise =
+            let o = lookup' name env in
+            update rest $ addModEntry n o m
+        mods = update updates caseMod
       wordSize <- gets getWordSize
       let isize = LLVM.IntegerType wordSize
       sequence_ $ for mods $ \(o ::: ty, ModEntry {..}) ->
@@ -672,28 +675,29 @@ genMatch app env modify = gen Nothing
                   let types = snd $ variants !! n
                   wordSize <- gets getWordSize
                   let isize = LLVM.IntegerType wordSize
+                  let
+                    eliminate [] rest = rest
+                    eliminate (True:xs) (_:ys) = eliminate xs ys
+                    eliminate (_:xs) (y:ys) = y : eliminate xs ys
+                    newTypes = eliminate anyMap types
                   newValues <-
-                    if null types then
+                    if null newTypes then
                       return []
                     else do
-                      lltypes <- lift $ sequence $ map genTy types
+                      lltypes <- lift $ sequence $ map genTy newTypes
                       let ty = ptr (LLVM.StructureType False (isize : lltypes))
                       castPtr <- bitcast dataPtr ty `named` fromString ("match.ptr." ++ show n)
                       buildTyped types $ buildGep castPtr
                   decPtr <- lift $ rcPtrDestructorOf types
                   let
-                    eliminate [] rest = rest
-                    eliminate (True:xs) (_:ys) = eliminate xs ys
-                    eliminate (_:xs) (y:ys) = y : eliminate xs ys
-                    updatedValues = eliminate anyMap newValues
                     addMods [] m = m
                     addMods (v:vs) m = addMods vs $ addModEntry 1 v m
                     updateCase GenCase { .. } = GenCase
                       { casePats = eliminate anyMap casePats,
-                        caseMod = addModDirect (-1) tv decPtr dataPtr $ addMods updatedValues caseMod,
+                        caseMod = addModDirect (-1) tv decPtr dataPtr $ addMods newValues caseMod,
                         .. }
                     updatedCases = map updateCase cs
-                  blocks <- gen (Just def) (updatedValues ++ vs) updatedCases ok bs
+                  blocks <- gen (Just def) (newValues ++ vs) updatedCases ok bs
                   (branches, blocks') <- consBranches rest blocks
                   return ((C.Int 32 $ toInteger n, name):branches, blocks')
               (branches, blocks') <- consBranches (Map.toList cases) blocks
@@ -730,11 +734,16 @@ genApp (TFunc _ ty) [arg] closure = do
 genApp (TFunc _ ty) (arg:rest) closure =
   genCallClosure closure arg `named` "partial" >>= genApp ty rest
 
-genIf :: Operand -> FallibleBuilder Operand -> FallibleBuilder Operand -> [(Typed Operand, Int)] -> FallibleBuilder Operand
-genIf i t e diffs = mdo
+genIf :: Operand
+      -> FallibleBuilder Operand
+      -> FallibleBuilder Operand
+      -> [(Typed Operand, Int)]
+      -> [(Typed Operand, Int)]
+      -> FallibleBuilder Operand
+genIf i t e diffT diffE = mdo
   condBr i thenBlock elseBlock
   thenBlock <- block `named` "if.then"
-  sequence_ $ map thenDec diffs
+  lift $ sequence_ $ map addDiff diffT
   thenList <-lift $ do
     m <- runMaybeT t `named` "if.then.res"
     case m of
@@ -744,7 +753,7 @@ genIf i t e diffs = mdo
         return [(res, resBlock)]
       Nothing -> return []
   elseBlock <- block `named` "if.else"
-  sequence_ $ map elseDec diffs
+  lift $ sequence_ $ map addDiff diffE
   elseList <- lift $ do
     m <- runMaybeT e `named` "if.else.res"
     case m of
@@ -760,11 +769,9 @@ genIf i t e diffs = mdo
   else
     phi elseList
   where
-    thenDec (o ::: ty, n)
-      | n < 0     = lift $ rcDec (-n) o ty
-      | otherwise = return ()
-    elseDec (o ::: ty, n)
-      | n > 0     = lift $ rcDec n o ty
+    addDiff (o ::: ty, n)
+      | n > 0 = rcInc n o ty
+      | n < 0 = rcDec (-n) o ty
       | otherwise = return ()
 
 genTy :: Type -> BuilderState LLVM.Type
@@ -1086,7 +1093,7 @@ rcPtrDestructorOf types' = do
             retVoid
         destructor <-
           llvmConstFn $ newFn
-            { fnName = "rc." ++ show (Map.size destructors) ++ ".",
+            { fnName = "rc.dec." ++ show (Map.size destructors) ++ ".",
               fnLinkage = L.Private,
               fnCC = CC.Fast,
               fnRetTy = void,

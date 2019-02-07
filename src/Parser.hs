@@ -400,14 +400,6 @@ isInfix Wide = True
 isInfix Compact = True
 isInfix _ = False
 
-data Assoc
-  = ALeft
-  | ANon
-  | ARight
-  deriving (Show, Eq)
-
-type Prec = Int
-
 word :: Parser String
 word = do
   first <- satisfy isIdentFirst
